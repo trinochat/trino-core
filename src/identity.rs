@@ -54,7 +54,21 @@ pub struct Identity {
     pub nostr: KeyPair,
     pub signed_prekey: SignedPreKey,
     pub one_time_prekeys: Vec<OneTimePreKey>,
+    /// Previously current signed prekeys, kept for a grace period.
+    ///
+    /// Rotation is what bounds the damage of a leaked signed prekey: without it
+    /// one compromised SPK exposes every initial message ever sent to us.
+    /// Retention is what makes rotation safe here — bundles are exchanged
+    /// out-of-band and cached by the peer, so a peer may legitimately hand us an
+    /// older `spk_id` long after we rotated. Dropping the old key immediately
+    /// would break those peers (and every auto-heal re-handshake from them).
+    pub retired_signed_prekeys: Vec<SignedPreKey>,
 }
+
+/// Generate a fresh signed prekey once the current one is this old.
+pub const SPK_ROTATION_SECS: i64 = 2 * 24 * 60 * 60; // 2 days, as Signal does
+/// Keep a retired signed prekey usable for this long after it stops being current.
+pub const SPK_RETENTION_SECS: i64 = 30 * 24 * 60 * 60; // 30 days
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PublicBundle {
@@ -188,6 +202,7 @@ pub fn create_identity() -> Identity {
         nostr,
         signed_prekey,
         one_time_prekeys,
+        retired_signed_prekeys: Vec::new(),
     }
 }
 
@@ -245,6 +260,59 @@ pub fn verify_bundle_binding(bundle: &PublicBundle) -> bool {
         &identity_signing_bytes(&ik_dh_pub, &nostr_pub),
         &id_sig,
     )
+}
+
+/// Look up a signed prekey by id: the current one, or one retired but still
+/// within its retention window. This is what lets a peer holding an older
+/// cached bundle still complete (or re-complete) a handshake.
+pub fn signed_prekey_by_id(identity: &Identity, spk_id: u32) -> Option<&SignedPreKey> {
+    if identity.signed_prekey.id == spk_id {
+        return Some(&identity.signed_prekey);
+    }
+    identity
+        .retired_signed_prekeys
+        .iter()
+        .find(|spk| spk.id == spk_id)
+}
+
+/// Rotate the signed prekey if it has aged past `SPK_ROTATION_SECS`, retiring
+/// the outgoing one, and drop retired keys past `SPK_RETENTION_SECS`.
+///
+/// Returns true when anything changed, so the caller knows to re-seal the vault
+/// and republish its bundle.
+pub fn rotate_signed_prekey_if_due(identity: &mut Identity, now: i64) -> bool {
+    let mut changed = false;
+
+    if now - identity.signed_prekey.created_at >= SPK_ROTATION_SECS {
+        let next_id = identity
+            .signed_prekey
+            .id
+            .max(
+                identity
+                    .retired_signed_prekeys
+                    .iter()
+                    .map(|s| s.id)
+                    .max()
+                    .unwrap_or(0),
+            )
+            .saturating_add(1);
+        let fresh = create_signed_prekey(&identity.ik_sign, next_id);
+        let outgoing = std::mem::replace(&mut identity.signed_prekey, fresh);
+        identity.retired_signed_prekeys.push(outgoing);
+        changed = true;
+    }
+
+    // Expire old keys. Forward secrecy only actually improves once the retired
+    // private key is gone, so this half of the job matters as much as rotating.
+    let before = identity.retired_signed_prekeys.len();
+    identity
+        .retired_signed_prekeys
+        .retain(|spk| now - spk.created_at < SPK_RETENTION_SECS);
+    if identity.retired_signed_prekeys.len() != before {
+        changed = true;
+    }
+
+    changed
 }
 
 pub fn consume_one_time_prekey(identity: &mut Identity, opk_id: u32) -> Option<OneTimePreKey> {

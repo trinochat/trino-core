@@ -71,6 +71,10 @@ struct SerializedIdentity {
     signed_pre_key: SerializedSignedPreKey,
     one_time_pre_keys: Vec<SerializedOneTimePreKey>,
     totp_secret: String,
+    /// Rotated-out signed prekeys still within their retention window.
+    /// Defaulted so vaults sealed before rotation existed still open.
+    #[serde(default)]
+    retired_signed_pre_keys: Vec<SerializedSignedPreKey>,
 }
 
 pub fn seal_vault(
@@ -175,6 +179,16 @@ fn serialize_identity(identity: &Identity, totp_secret: &[u8]) -> SerializedIden
             })
             .collect(),
         totp_secret: hex::encode(totp_secret),
+        retired_signed_pre_keys: identity
+            .retired_signed_prekeys
+            .iter()
+            .map(|s| SerializedSignedPreKey {
+                id: s.id,
+                keypair: kp_to_ser(&s.keypair),
+                signature: hex::encode(s.signature),
+                created_at: s.created_at,
+            })
+            .collect(),
     }
 }
 
@@ -196,6 +210,18 @@ fn deserialize_identity(s: SerializedIdentity) -> Result<(Identity, Vec<u8>), Va
                 Ok::<OneTimePreKey, VaultError>(OneTimePreKey {
                     id: o.id,
                     keypair: kp_from_ser(&o.keypair)?,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        retired_signed_prekeys: s
+            .retired_signed_pre_keys
+            .iter()
+            .map(|r| {
+                Ok::<SignedPreKey, VaultError>(SignedPreKey {
+                    id: r.id,
+                    keypair: kp_from_ser(&r.keypair)?,
+                    signature: decode_array_64(&r.signature)?,
+                    created_at: r.created_at,
                 })
             })
             .collect::<Result<Vec<_>, _>>()?,

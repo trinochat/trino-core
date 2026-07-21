@@ -1,6 +1,7 @@
 use crate::crypto::{concat, hkdf_expand, CryptoError};
 use crate::identity::{
-    consume_one_time_prekey, decode_array_32, generate_x25519, verify_bundle, x25519_derive_shared,
+    consume_one_time_prekey, decode_array_32, generate_x25519, signed_prekey_by_id, verify_bundle,
+    x25519_derive_shared,
     Identity, IdentityError, PublicBundle,
 };
 use serde::{Deserialize, Serialize};
@@ -85,13 +86,17 @@ pub fn initiate(ours: &Identity, theirs: &PublicBundle) -> Result<InitiatorResul
 }
 
 pub fn respond(ours: &mut Identity, msg: &InitialMessage) -> Result<ResponderResult, X3dhError> {
-    if msg.spk_id != ours.signed_prekey.id {
-        return Err(X3dhError::UnknownSpk(msg.spk_id));
-    }
+    // Accept the current signed prekey OR one we rotated away from but still
+    // retain. Peers cache our bundle out-of-band, so after a rotation they will
+    // legitimately keep presenting the older id — including on every auto-heal
+    // re-handshake. Rejecting those would strand the peer permanently.
+    let spk_priv = signed_prekey_by_id(ours, msg.spk_id)
+        .ok_or(X3dhError::UnknownSpk(msg.spk_id))?
+        .keypair
+        .priv_bytes;
+
     let their_ik_dh_pub = decode_array_32(&msg.ik_dh_pub)?;
     let their_ek_pub = decode_array_32(&msg.ek_pub)?;
-
-    let spk_priv = ours.signed_prekey.keypair.priv_bytes;
 
     let dh1 = x25519_derive_shared(&spk_priv, &their_ik_dh_pub);
     let dh2 = x25519_derive_shared(&ours.ik_dh.priv_bytes, &their_ek_pub);
@@ -156,6 +161,56 @@ mod tests {
         let first = respond(&mut bob, &init.message).unwrap();
         let second = respond(&mut bob, &init.message).unwrap();
         assert_eq!(first.master_secret, second.master_secret);
+    }
+
+    #[test]
+    fn peer_with_cached_bundle_still_works_after_rotation() {
+        // The whole point of retention: Bob rotates his signed prekey, but
+        // Alice is still holding the bundle she pasted days ago. She must keep
+        // being able to hand shake — otherwise every rotation would strand
+        // every peer, including on auto-heal re-handshakes.
+        use crate::identity::rotate_signed_prekey_if_due;
+
+        let alice = create_identity();
+        let mut bob = create_identity();
+        let old_bundle = public_bundle_for(&bob); // Alice caches this
+
+        let far_future = bob.signed_prekey.created_at + crate::identity::SPK_ROTATION_SECS + 1;
+        assert!(rotate_signed_prekey_if_due(&mut bob, far_future));
+        assert_ne!(bob.signed_prekey.id, old_bundle.spk_id, "should have rotated");
+
+        let init = initiate(&alice, &old_bundle).unwrap();
+        let resp = respond(&mut bob, &init.message).expect("retired SPK must still resolve");
+        assert_eq!(init.master_secret, resp.master_secret);
+    }
+
+    #[test]
+    fn retired_spk_stops_working_once_expired() {
+        // Forward secrecy only actually improves when the retired private key
+        // is gone, so expiry must genuinely drop it.
+        use crate::identity::{rotate_signed_prekey_if_due, SPK_RETENTION_SECS, SPK_ROTATION_SECS};
+
+        let alice = create_identity();
+        let mut bob = create_identity();
+        let old_bundle = public_bundle_for(&bob);
+        let init = initiate(&alice, &old_bundle).unwrap();
+
+        let t0 = bob.signed_prekey.created_at;
+        rotate_signed_prekey_if_due(&mut bob, t0 + SPK_ROTATION_SECS + 1);
+        rotate_signed_prekey_if_due(&mut bob, t0 + SPK_RETENTION_SECS + 1);
+
+        assert!(bob.retired_signed_prekeys.is_empty(), "retired key must be dropped");
+        assert!(respond(&mut bob, &init.message).is_err());
+    }
+
+    #[test]
+    fn rotation_is_not_due_before_its_time() {
+        use crate::identity::rotate_signed_prekey_if_due;
+        let mut bob = create_identity();
+        let id_before = bob.signed_prekey.id;
+        let just_after_creation = bob.signed_prekey.created_at + 60;
+        assert!(!rotate_signed_prekey_if_due(&mut bob, just_after_creation));
+        assert_eq!(bob.signed_prekey.id, id_before);
     }
 
     #[test]
