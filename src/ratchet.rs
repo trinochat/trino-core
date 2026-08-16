@@ -576,6 +576,32 @@ mod tests {
         ));
     }
 
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(48))]
+
+        /// Whatever order the network happens to deliver a burst in, every
+        /// message must come out intact and exactly once. That is the entire
+        /// promise of the skipped-key machinery, and it is the property the
+        /// hand-written out-of-order tests can only sample.
+        #[test]
+        fn every_delivery_order_decrypts_every_message(
+            weights in proptest::collection::vec(proptest::prelude::any::<u32>(), 8)
+        ) {
+            let (mut alice, mut bob, ad) = pair();
+            let sent: Vec<_> = (0..8)
+                .map(|i| ratchet_encrypt(&mut alice, format!("m{i}").as_bytes(), &ad).unwrap())
+                .collect();
+
+            let mut order: Vec<usize> = (0..8).collect();
+            order.sort_by_key(|&i| weights[i]);
+
+            for &i in &order {
+                let plaintext = ratchet_decrypt(&mut bob, &sent[i], &ad).unwrap();
+                proptest::prop_assert_eq!(plaintext, format!("m{i}").into_bytes());
+            }
+        }
+    }
+
     #[test]
     fn banked_keys_stay_under_the_global_cap_across_dh_steps() {
         let (mut alice, mut bob, ad) = pair();
