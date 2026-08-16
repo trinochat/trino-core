@@ -1,14 +1,19 @@
 [package]
 name = "trino-core"
 version = "0.1.0"
-description = "Trino Chat protocol core: X3DH, Double Ratchet, identity, envelope and sealed vault"
+description = "Protocol core for Trino Chat: X3DH, Double Ratchet, identity, message envelope and sealed vault"
 edition = "2021"
 license = "AGPL-3.0-only"
+authors = ["davidalmeidac"]
+repository = "https://github.com/trinochat/trino-core"
+readme = "README.md"
+keywords = ["cryptography", "double-ratchet", "x3dh", "e2ee", "messaging"]
+categories = ["cryptography", "authentication"]
 
 # This crate is deliberately PURE: no networking, no async runtime, no UI, no
 # platform APIs. It holds only the cryptography and wire format, so it can be
 # audited on its own and reused by every client (desktop today, Flutter mobile
-# over FFI next). Anything that performs I/O belongs in the app, not here.
+# over FFI next). Anything that performs I/O belongs in the application.
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

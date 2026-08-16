@@ -1,0 +1,45 @@
+# cargo-deny — licence and advisory policy.
+#
+# trino-core is AGPL-3.0 with a commercial licence available from the copyright
+# holder. That dual licensing only works while every dependency is permissively
+# licensed: pulling in a single GPL/AGPL crate would make it impossible to grant
+# a non-AGPL licence for a binary built from this code.
+#
+# This is why libsignal (AGPL-3.0, no exceptions) cannot be adopted here.
+#
+# Run with:  cargo deny check
+# Install:   cargo install cargo-deny
+
+[licenses]
+# Permissive licences only — anything copyleft must be an explicit decision,
+# not something that slips in during a `cargo update`.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+    "MPL-2.0",       # file-level copyleft only; does not infect the binary
+    "BSL-1.0",
+    "Unlicense",
+    "OpenSSL",
+]
+confidence-threshold = 0.8
+
+[bans]
+# Crates that would poison the dual-licence model if they ever appeared.
+deny = [
+    { name = "libsignal-protocol" },
+]
+
+[advisories]
+# Fail the build on known vulnerabilities.
+yanked = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
