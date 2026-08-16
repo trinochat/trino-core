@@ -1,7 +1,7 @@
 use crate::crypto::{aes_gcm_decrypt, aes_gcm_encrypt, concat, hkdf_expand, CryptoError};
 use crate::identity::{generate_x25519, x25519_derive_shared, KeyPair};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 use zeroize::Zeroize;
 
@@ -13,6 +13,13 @@ const ZERO_SALT: [u8; 32] = [0u8; 32];
 // Max messages we will skip (derive+store keys for) in one chain before refusing.
 const MAX_SKIP: u32 = 1000;
 const MAX_RETIRED_DH_KEYS: usize = 8;
+
+// Ceiling on banked out-of-order keys across ALL chains. MAX_SKIP only bounds a
+// single gap: without a global cap a peer can bank another 1000 keys on every DH
+// step, forever, growing the state we persist into the vault without limit.
+// Past the cap the oldest keys are dropped — those messages become permanently
+// undecryptable, which is the correct trade against unbounded growth.
+const MAX_SKIPPED_KEYS: usize = 2000;
 
 #[derive(Debug, Error)]
 pub enum RatchetError {
@@ -42,6 +49,10 @@ pub struct RatchetState {
     pub previous_sending_chain_length: u32,
     // Derived-but-unused message keys for out-of-order delivery, keyed "dhPubHex:n".
     pub skipped_keys: HashMap<String, [u8; 32]>,
+    // Insertion order over `skipped_keys`, so the global cap can evict the
+    // oldest first. Defaulted so sessions sealed before the cap existed load.
+    #[serde(default)]
+    pub skipped_key_order: Vec<String>,
     // Recently retired peer DH keys classify stale old-chain ciphertext as a
     // replay instead of a new ratchet step.
     #[serde(default)]
@@ -64,6 +75,7 @@ impl RatchetState {
         self.sending_chain_key = None;
         self.receiving_chain_key = None;
         self.skipped_keys.clear();
+        self.skipped_key_order.clear();
     }
 }
 
@@ -106,6 +118,7 @@ pub fn init_initiator(
         receiving_msg_number: 0,
         previous_sending_chain_length: 0,
         skipped_keys: HashMap::new(),
+        skipped_key_order: Vec::new(),
         retired_peer_dh_keys: Vec::new(),
     })
 }
@@ -121,6 +134,7 @@ pub fn init_responder(master_secret: [u8; 32], our_spk_keypair: KeyPair) -> Ratc
         receiving_msg_number: 0,
         previous_sending_chain_length: 0,
         skipped_keys: HashMap::new(),
+        skipped_key_order: Vec::new(),
         retired_peer_dh_keys: Vec::new(),
     }
 }
@@ -248,7 +262,53 @@ fn try_skipped_message_key(
     let nonce = decode_hex(&msg.nonce)?;
     let pt = aes_gcm_decrypt(&mk, &ciphertext, &nonce, Some(&ad))?;
     state.skipped_keys.remove(&id);
+    state.skipped_key_order.retain(|k| k != &id);
     Ok(Some(pt))
+}
+
+/// Bank a derived-but-unused message key, enforcing the global ceiling.
+fn bank_skipped_key(state: &mut RatchetState, id: String, mk: [u8; 32]) {
+    match state.skipped_keys.insert(id.clone(), mk) {
+        Some(mut replaced) => replaced.zeroize(),
+        None => state.skipped_key_order.push(id),
+    }
+    evict_oldest_skipped_keys(state);
+}
+
+fn evict_oldest_skipped_keys(state: &mut RatchetState) {
+    if state.skipped_keys.len() <= MAX_SKIPPED_KEYS {
+        return;
+    }
+    adopt_unordered_skipped_keys(state);
+    while state.skipped_keys.len() > MAX_SKIPPED_KEYS {
+        if state.skipped_key_order.is_empty() {
+            break;
+        }
+        let oldest = state.skipped_key_order.remove(0);
+        if let Some(mut mk) = state.skipped_keys.remove(&oldest) {
+            mk.zeroize();
+        }
+    }
+}
+
+/// A session sealed before `skipped_key_order` existed loads with a full map and
+/// an empty order list. Adopt those keys — sorted, so eviction stays
+/// deterministic — ahead of anything we do have an order for, since they are by
+/// definition older.
+fn adopt_unordered_skipped_keys(state: &mut RatchetState) {
+    if state.skipped_key_order.len() == state.skipped_keys.len() {
+        return;
+    }
+    let known: HashSet<String> = state.skipped_key_order.iter().cloned().collect();
+    let mut adopted: Vec<String> = state
+        .skipped_keys
+        .keys()
+        .filter(|k| !known.contains(*k))
+        .cloned()
+        .collect();
+    adopted.sort();
+    adopted.append(&mut state.skipped_key_order);
+    state.skipped_key_order = adopted;
 }
 
 fn skip_message_keys(state: &mut RatchetState, until: u32) -> Result<(), RatchetError> {
@@ -267,9 +327,7 @@ fn skip_message_keys(state: &mut RatchetState, until: u32) -> Result<(), Ratchet
     while state.receiving_msg_number < until {
         let (next_ck, mk) = kdf_ck(&ck)?;
         ck = next_ck;
-        state
-            .skipped_keys
-            .insert(skipped_key_id(&dhr, state.receiving_msg_number), mk);
+        bank_skipped_key(state, skipped_key_id(&dhr, state.receiving_msg_number), mk);
         state.receiving_msg_number += 1;
     }
     state.receiving_chain_key = Some(ck);
@@ -516,6 +574,67 @@ mod tests {
             ratchet_decrypt(&mut bob, &old, &ad),
             Err(RatchetError::Replay { n: 0 })
         ));
+    }
+
+    #[test]
+    fn banked_keys_stay_under_the_global_cap_across_dh_steps() {
+        let (mut alice, mut bob, ad) = pair();
+        // Each round banks ~900 keys. Three rounds would reach ~2700 without a
+        // global ceiling — MAX_SKIP alone does not stop this.
+        for _round in 0..3 {
+            let mut cts = vec![];
+            for i in 0..900 {
+                cts.push(ratchet_encrypt(&mut alice, format!("m{i}").as_bytes(), &ad).unwrap());
+            }
+            // Only the newest arrives; everything before it gets banked.
+            ratchet_decrypt(&mut bob, cts.last().unwrap(), &ad).unwrap();
+            assert!(bob.skipped_keys.len() <= MAX_SKIPPED_KEYS);
+
+            // Force a DH step so the next round banks under a fresh chain.
+            let reply = ratchet_encrypt(&mut bob, b"reply", &ad).unwrap();
+            ratchet_decrypt(&mut alice, &reply, &ad).unwrap();
+        }
+        assert_eq!(bob.skipped_keys.len(), MAX_SKIPPED_KEYS);
+        assert_eq!(bob.skipped_key_order.len(), bob.skipped_keys.len());
+    }
+
+    #[test]
+    fn consuming_a_banked_key_also_clears_its_order_entry() {
+        let (mut alice, mut bob, ad) = pair();
+        let m0 = ratchet_encrypt(&mut alice, b"m0", &ad).unwrap();
+        let m1 = ratchet_encrypt(&mut alice, b"m1", &ad).unwrap();
+        ratchet_decrypt(&mut bob, &m1, &ad).unwrap(); // banks m0's key
+        assert_eq!(bob.skipped_keys.len(), 1);
+        assert_eq!(bob.skipped_key_order.len(), 1);
+
+        ratchet_decrypt(&mut bob, &m0, &ad).unwrap(); // consumes it
+        assert!(bob.skipped_keys.is_empty());
+        assert!(bob.skipped_key_order.is_empty());
+    }
+
+    #[test]
+    fn legacy_banked_keys_without_an_order_list_are_evicted_to_the_cap() {
+        let (_alice, mut bob, _ad) = pair();
+        // A session sealed before the cap existed: banked keys, no order list.
+        for n in 0..(MAX_SKIPPED_KEYS as u32 + 50) {
+            bob.skipped_keys
+                .insert(skipped_key_id(&[7u8; 32], n), [1u8; 32]);
+        }
+        assert!(bob.skipped_key_order.is_empty());
+
+        evict_oldest_skipped_keys(&mut bob);
+
+        assert_eq!(bob.skipped_keys.len(), MAX_SKIPPED_KEYS);
+        assert_eq!(bob.skipped_key_order.len(), MAX_SKIPPED_KEYS);
+    }
+
+    #[test]
+    fn session_sealed_before_the_cap_still_deserializes() {
+        let (_alice, bob, _ad) = pair();
+        let mut raw = serde_json::to_value(&bob).unwrap();
+        raw.as_object_mut().unwrap().remove("skipped_key_order");
+        let reloaded: RatchetState = serde_json::from_value(raw).unwrap();
+        assert!(reloaded.skipped_key_order.is_empty());
     }
 
     #[test]
