@@ -1,8 +1,7 @@
 use crate::crypto::{concat, hkdf_expand, CryptoError};
 use crate::identity::{
     consume_one_time_prekey, decode_array_32, generate_x25519, signed_prekey_by_id, verify_bundle,
-    x25519_derive_shared,
-    Identity, IdentityError, PublicBundle,
+    x25519_derive_shared, Identity, IdentityError, PublicBundle,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -177,7 +176,10 @@ mod tests {
 
         let far_future = bob.signed_prekey.created_at + crate::identity::SPK_ROTATION_SECS + 1;
         assert!(rotate_signed_prekey_if_due(&mut bob, far_future));
-        assert_ne!(bob.signed_prekey.id, old_bundle.spk_id, "should have rotated");
+        assert_ne!(
+            bob.signed_prekey.id, old_bundle.spk_id,
+            "should have rotated"
+        );
 
         let init = initiate(&alice, &old_bundle).unwrap();
         let resp = respond(&mut bob, &init.message).expect("retired SPK must still resolve");
@@ -199,7 +201,10 @@ mod tests {
         rotate_signed_prekey_if_due(&mut bob, t0 + SPK_ROTATION_SECS + 1);
         rotate_signed_prekey_if_due(&mut bob, t0 + SPK_RETENTION_SECS + 1);
 
-        assert!(bob.retired_signed_prekeys.is_empty(), "retired key must be dropped");
+        assert!(
+            bob.retired_signed_prekeys.is_empty(),
+            "retired key must be dropped"
+        );
         assert!(respond(&mut bob, &init.message).is_err());
     }
 
