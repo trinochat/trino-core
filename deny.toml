@@ -30,6 +30,13 @@ allow = [
 ]
 confidence-threshold = 0.8
 
+# The allow-list above governs DEPENDENCIES. This crate is itself AGPL-3.0, and
+# cargo-deny evaluates the whole graph including the root, so it needs an
+# explicit exception — otherwise the policy rejects the very crate it protects.
+exceptions = [
+    { name = "trino-core", allow = ["AGPL-3.0-only"] },
+]
+
 [bans]
 # Crates that would poison the dual-licence model if they ever appeared.
 deny = [
