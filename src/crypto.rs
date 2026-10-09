@@ -1,3 +1,5 @@
+#![doc = include_str!("../docs/crypto.md")]
+
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use hkdf::Hkdf;
@@ -6,10 +8,22 @@ use sha2::Sha256;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
+/// AES-256-GCM key length in bytes.
+///
+/// Details: docs/crypto.md#aes-gcm
 pub const KEY_SIZE: usize = 32;
+/// AES-GCM nonce length in bytes (96 bits).
+///
+/// Details: docs/crypto.md#aes-gcm
 pub const NONCE_SIZE: usize = 12;
+/// AES-GCM tag length in bytes, appended to every ciphertext.
+///
+/// Details: docs/crypto.md#aes-gcm
 pub const TAG_SIZE: usize = 16;
 
+/// Errors from the primitives in this module.
+///
+/// Details: docs/crypto.md#errors
 #[derive(Debug, Error)]
 pub enum CryptoError {
     #[error("invalid key length: expected {expected}, got {got}")]
@@ -22,18 +36,27 @@ pub enum CryptoError {
     Hkdf,
 }
 
+/// Returns `n` bytes from the thread-local CSPRNG.
+///
+/// Details: docs/crypto.md#random
 pub fn random_bytes(n: usize) -> Vec<u8> {
     let mut buf = vec![0u8; n];
     rand::thread_rng().fill_bytes(&mut buf);
     buf
 }
 
+/// Returns `N` bytes from the thread-local CSPRNG as an array.
+///
+/// Details: docs/crypto.md#random
 pub fn random_array<const N: usize>() -> [u8; N] {
     let mut buf = [0u8; N];
     rand::thread_rng().fill_bytes(&mut buf);
     buf
 }
 
+/// SHA-256 digest of `data`.
+///
+/// Details: docs/crypto.md#sha256
 pub fn sha256(data: &[u8]) -> [u8; 32] {
     use sha2::Digest;
     let mut hasher = Sha256::new();
@@ -41,6 +64,9 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+/// Derives `length` bytes from `ikm` with HKDF-SHA256; the output is wiped on drop.
+///
+/// Details: docs/crypto.md#hkdf
 pub fn hkdf_expand(
     ikm: &[u8],
     salt: &[u8],
@@ -53,6 +79,9 @@ pub fn hkdf_expand(
     Ok(okm)
 }
 
+/// Encrypts with AES-256-GCM under a fresh random nonce; returns ciphertext and tag, and the nonce.
+///
+/// Details: docs/crypto.md#aes-gcm
 pub fn aes_gcm_encrypt(
     key: &[u8],
     plaintext: &[u8],
@@ -89,6 +118,9 @@ fn aes_gcm_encrypt_with_nonce(
         .map_err(|_| CryptoError::Aead)
 }
 
+/// Authenticates and decrypts AES-256-GCM output; any mismatch is `CryptoError::Aead`.
+///
+/// Details: docs/crypto.md#aes-gcm
 pub fn aes_gcm_decrypt(
     key: &[u8],
     ciphertext: &[u8],
@@ -121,12 +153,18 @@ pub fn aes_gcm_decrypt(
         .map_err(|_| CryptoError::Aead)
 }
 
+/// Derives a 32-byte key from a passphrase with PBKDF2-HMAC-SHA256; the key is wiped on drop.
+///
+/// Details: docs/crypto.md#pbkdf2
 pub fn pbkdf2_sha256(passphrase: &[u8], salt: &[u8], iterations: u32) -> Zeroizing<[u8; 32]> {
     let mut out = Zeroizing::new([0u8; 32]);
     pbkdf2::pbkdf2_hmac::<Sha256>(passphrase, salt, iterations, &mut out[..]);
     out
 }
 
+/// Joins byte slices with no separators: only for parts of fixed length.
+///
+/// Details: docs/crypto.md#concat
 pub fn concat(parts: &[&[u8]]) -> Vec<u8> {
     let total: usize = parts.iter().map(|p| p.len()).sum();
     let mut out = Vec::with_capacity(total);
@@ -136,10 +174,16 @@ pub fn concat(parts: &[&[u8]]) -> Vec<u8> {
     out
 }
 
+/// Lowercase hex encoding of `bytes`.
+///
+/// Details: docs/crypto.md#hex
 pub fn to_hex(bytes: &[u8]) -> String {
     hex::encode(bytes)
 }
 
+/// Decodes hex in either case; does not check the length.
+///
+/// Details: docs/crypto.md#hex
 pub fn from_hex(s: &str) -> Result<Vec<u8>, hex::FromHexError> {
     hex::decode(s)
 }
