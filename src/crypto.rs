@@ -57,6 +57,18 @@ pub fn aes_gcm_encrypt(
     plaintext: &[u8],
     associated_data: Option<&[u8]>,
 ) -> Result<(Vec<u8>, [u8; NONCE_SIZE]), CryptoError> {
+    let nonce: [u8; NONCE_SIZE] = random_array();
+    let ciphertext = aes_gcm_encrypt_with_nonce(key, &nonce, plaintext, associated_data)?;
+    Ok((ciphertext, nonce))
+}
+
+/// Encrypts under a caller-chosen nonce. Private: a nonce reused under one key breaks GCM.
+fn aes_gcm_encrypt_with_nonce(
+    key: &[u8],
+    nonce: &[u8; NONCE_SIZE],
+    plaintext: &[u8],
+    associated_data: Option<&[u8]>,
+) -> Result<Vec<u8>, CryptoError> {
     if key.len() != KEY_SIZE {
         return Err(CryptoError::InvalidKeyLength {
             expected: KEY_SIZE,
@@ -64,9 +76,6 @@ pub fn aes_gcm_encrypt(
         });
     }
     let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| CryptoError::Aead)?;
-    let nonce_bytes: [u8; NONCE_SIZE] = random_array();
-    let nonce = Nonce::from_slice(&nonce_bytes);
-
     let payload = match associated_data {
         Some(aad) => Payload {
             msg: plaintext,
@@ -74,10 +83,9 @@ pub fn aes_gcm_encrypt(
         },
         None => Payload::from(plaintext),
     };
-    let ciphertext = cipher
-        .encrypt(nonce, payload)
-        .map_err(|_| CryptoError::Aead)?;
-    Ok((ciphertext, nonce_bytes))
+    cipher
+        .encrypt(Nonce::from_slice(nonce), payload)
+        .map_err(|_| CryptoError::Aead)
 }
 
 pub fn aes_gcm_decrypt(
@@ -173,6 +181,24 @@ mod tests {
     }
 
     #[test]
+    fn aes_gcm_rejects_a_key_of_the_wrong_length() {
+        assert!(matches!(
+            aes_gcm_encrypt(&[0u8; 16], b"msg", None),
+            Err(CryptoError::InvalidKeyLength {
+                expected: 32,
+                got: 16
+            })
+        ));
+        assert!(matches!(
+            aes_gcm_decrypt(&[0u8; 16], &[0u8; 32], &[0u8; NONCE_SIZE], None),
+            Err(CryptoError::InvalidKeyLength {
+                expected: 32,
+                got: 16
+            })
+        ));
+    }
+
+    #[test]
     fn hkdf_outputs_length() {
         let ikm = b"input keying material";
         let salt = [0u8; 32];
@@ -185,5 +211,149 @@ mod tests {
         let a = pbkdf2_sha256(b"pass", b"salt", 1000);
         let b = pbkdf2_sha256(b"pass", b"salt", 1000);
         assert_eq!(a, b);
+    }
+
+    fn unhex(s: &str) -> Vec<u8> {
+        from_hex(s).expect("test vector is valid hex")
+    }
+
+    // RFC 5869, Appendix A, test cases A.1-A.3: https://www.rfc-editor.org/rfc/rfc5869#appendix-A
+    #[test]
+    fn hkdf_matches_rfc5869_a1_basic() {
+        let okm = hkdf_expand(
+            &unhex("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b"),
+            &unhex("000102030405060708090a0b0c"),
+            &unhex("f0f1f2f3f4f5f6f7f8f9"),
+            42,
+        )
+        .unwrap();
+        assert_eq!(
+            to_hex(&okm),
+            concat!(
+                "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf",
+                "34007208d5b887185865"
+            )
+        );
+    }
+
+    #[test]
+    fn hkdf_matches_rfc5869_a2_long_inputs() {
+        let ikm: Vec<u8> = (0x00..=0x4f).collect();
+        let salt: Vec<u8> = (0x60..=0xaf).collect();
+        let info: Vec<u8> = (0xb0..=0xff).collect();
+        let okm = hkdf_expand(&ikm, &salt, &info, 82).unwrap();
+        assert_eq!(
+            to_hex(&okm),
+            concat!(
+                "b11e398dc80327a1c8e7f78c596a49344f012eda2d4efad8a050cc4c19afa97c",
+                "59045a99cac7827271cb41c65e590e09da3275600c2f09b8367793a9aca3db71",
+                "cc30c58179ec3e87c14c01d5c1f3434f1d87"
+            )
+        );
+    }
+
+    #[test]
+    fn hkdf_matches_rfc5869_a3_empty_salt_as_absent_salt() {
+        let ikm = unhex("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b");
+        let expected = concat!(
+            "8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d",
+            "9d201395faa4b61a96c8"
+        );
+        // An absent salt is HashLen zero bytes (RFC 5869 §2.2); HMAC zero-pads
+        // short keys, so the empty salt and Trino's 32-byte zero salt match it.
+        let mut absent = [0u8; 42];
+        Hkdf::<Sha256>::new(None, &ikm)
+            .expand(&[], &mut absent)
+            .unwrap();
+        assert_eq!(to_hex(&absent), expected);
+        assert_eq!(to_hex(&hkdf_expand(&ikm, &[], &[], 42).unwrap()), expected);
+        assert_eq!(
+            to_hex(&hkdf_expand(&ikm, &[0u8; 32], &[], 42).unwrap()),
+            expected
+        );
+    }
+
+    // NIST CSRC example values, AES_GCM.pdf, GCM-AES256 Examples #1-#5: https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Standards-and-Guidelines/documents/examples/AES_GCM.pdf
+    const NIST_KEY: &str = "feffe9928665731c6d6a8f9467308308feffe9928665731c6d6a8f9467308308";
+    const NIST_IV: &str = "cafebabefacedbaddecaf888";
+    const NIST_AAD: &str = concat!(
+        "3ad77bb40d7a3660a89ecaf32466ef97f5d3d58503b9699de785895a96fdbaaf",
+        "43b1cd7f598ece23881b00e3ed0306887b0c785e27e8ad3f8223207104725dd4"
+    );
+    const NIST_PT: &str = concat!(
+        "d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a72",
+        "1c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b391aafd255"
+    );
+    const NIST_CT: &str = concat!(
+        "522dc1f099567d07f47f37a32a84427d643a8cdcbfe5c0c97598a2bd2555d1aa",
+        "8cb08e48590dbb3da7b08b1056828838c5f61e6393ba7a0abcc9f662898015ad"
+    );
+
+    #[test]
+    fn aes_gcm_matches_nist_gcm_aes256_examples() {
+        let key = unhex(NIST_KEY);
+        let nonce: [u8; NONCE_SIZE] = unhex(NIST_IV).try_into().unwrap();
+        // (AAD, plaintext, ciphertext, tag); #5 uses 20 bytes of AAD and 60 of plaintext.
+        let examples = [
+            ("", "", "", "fd2caa16a5832e76aa132c1453eeda7e"),
+            ("", NIST_PT, NIST_CT, "b094dac5d93471bdec1a502270e3cc6c"),
+            (NIST_AAD, "", "", "de34b6dcd4cee2fdbec3cea01af1ee44"),
+            (
+                NIST_AAD,
+                NIST_PT,
+                NIST_CT,
+                "c06d76f31930fef37acae23ed465ae62",
+            ),
+            (
+                &NIST_AAD[..40],
+                &NIST_PT[..120],
+                &NIST_CT[..120],
+                "e097195f4532da895fb917a5a55c6aa0",
+            ),
+        ];
+        for (n, (aad_hex, pt_hex, ct_hex, tag_hex)) in examples.into_iter().enumerate() {
+            let (aad_bytes, pt) = (unhex(aad_hex), unhex(pt_hex));
+            let aad = (!aad_bytes.is_empty()).then_some(aad_bytes.as_slice());
+            let sealed = aes_gcm_encrypt_with_nonce(&key, &nonce, &pt, aad).unwrap();
+            assert_eq!(
+                to_hex(&sealed),
+                format!("{ct_hex}{tag_hex}"),
+                "example #{}",
+                n + 1
+            );
+            let opened = aes_gcm_decrypt(&key, &sealed, &nonce, aad).unwrap();
+            assert_eq!(opened, pt, "example #{}", n + 1);
+        }
+    }
+
+    #[test]
+    fn aes_gcm_encrypt_is_the_explicit_nonce_form_with_a_fresh_nonce() {
+        let key = random_array::<32>();
+        let (first, nonce) = aes_gcm_encrypt(&key, b"msg", Some(b"ad")).unwrap();
+        let (_, other_nonce) = aes_gcm_encrypt(&key, b"msg", Some(b"ad")).unwrap();
+        assert_ne!(nonce, other_nonce);
+        assert_eq!(
+            first,
+            aes_gcm_encrypt_with_nonce(&key, &nonce, b"msg", Some(b"ad")).unwrap()
+        );
+    }
+
+    // RFC 7914, Section 11, first 32 of the 64 output bytes: https://www.rfc-editor.org/rfc/rfc7914#section-11
+    #[test]
+    fn pbkdf2_matches_rfc7914_one_iteration() {
+        let dk = pbkdf2_sha256(b"passwd", b"salt", 1);
+        assert_eq!(
+            to_hex(&dk[..]),
+            "55ac046e56e3089fec1691c22544b605f94185216dde0465e68b9d57c20dacbc"
+        );
+    }
+
+    #[test]
+    fn pbkdf2_matches_rfc7914_80000_iterations() {
+        let dk = pbkdf2_sha256(b"Password", b"NaCl", 80_000);
+        assert_eq!(
+            to_hex(&dk[..]),
+            "4ddcd8f60b98be21830cee5ef22701f9641a4418d04c0414aeff08876b34ab56"
+        );
     }
 }
