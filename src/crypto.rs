@@ -4,6 +4,7 @@ use hkdf::Hkdf;
 use rand::RngCore;
 use sha2::Sha256;
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 pub const KEY_SIZE: usize = 32;
 pub const NONCE_SIZE: usize = 12;
@@ -45,9 +46,9 @@ pub fn hkdf_expand(
     salt: &[u8],
     info: &[u8],
     length: usize,
-) -> Result<Vec<u8>, CryptoError> {
+) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
     let hk = Hkdf::<Sha256>::new(Some(salt), ikm);
-    let mut okm = vec![0u8; length];
+    let mut okm = Zeroizing::new(vec![0u8; length]);
     hk.expand(info, &mut okm).map_err(|_| CryptoError::Hkdf)?;
     Ok(okm)
 }
@@ -120,9 +121,9 @@ pub fn aes_gcm_decrypt(
         .map_err(|_| CryptoError::Aead)
 }
 
-pub fn pbkdf2_sha256(passphrase: &[u8], salt: &[u8], iterations: u32) -> [u8; 32] {
-    let mut out = [0u8; 32];
-    pbkdf2::pbkdf2_hmac::<Sha256>(passphrase, salt, iterations, &mut out);
+pub fn pbkdf2_sha256(passphrase: &[u8], salt: &[u8], iterations: u32) -> Zeroizing<[u8; 32]> {
+    let mut out = Zeroizing::new([0u8; 32]);
+    pbkdf2::pbkdf2_hmac::<Sha256>(passphrase, salt, iterations, &mut out[..]);
     out
 }
 
@@ -146,6 +147,14 @@ pub fn from_hex(s: &str) -> Result<Vec<u8>, hex::FromHexError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn derived_keys_come_back_in_zeroizing_buffers() {
+        let key: Zeroizing<[u8; 32]> = pbkdf2_sha256(b"passwd", b"salt", 1);
+        let okm: Zeroizing<Vec<u8>> = hkdf_expand(b"ikm", &[], b"info", 32).unwrap();
+        assert_eq!(key.len(), KEY_SIZE);
+        assert_eq!(okm.len(), 32);
+    }
 
     #[test]
     fn sha256_known_vector() {

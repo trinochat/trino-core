@@ -141,7 +141,7 @@ pub fn seal_vault(
     let payload = serialize_identity(identity, totp_secret);
     let payload_bytes = serde_json::to_vec(&payload).map_err(|_| VaultError::BadPayload)?;
 
-    let (ciphertext, nonce) = aes_gcm_encrypt(&key, &payload_bytes, None)?;
+    let (ciphertext, nonce) = aes_gcm_encrypt(key.as_slice(), &payload_bytes, None)?;
     let flags = match totp_secret {
         Some(_) => 0,
         None => FLAG_NO_TOTP,
@@ -170,7 +170,7 @@ pub fn unseal_vault(
     check_header(blob.version, blob.flags)?;
 
     let key = pbkdf2_sha256(passphrase.as_bytes(), &blob.salt, PBKDF2_ITERATIONS);
-    let plaintext = aes_gcm_decrypt(&key, &blob.ciphertext, &blob.nonce, None)
+    let plaintext = aes_gcm_decrypt(key.as_slice(), &blob.ciphertext, &blob.nonce, None)
         .map_err(|_| VaultError::DecryptionFailed)?;
 
     let serialized: SerializedIdentity =
