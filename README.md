@@ -36,8 +36,11 @@ pursued.
   Ciphertext from a completed chain is classified as a replay rather than
   mistaken for a new ratchet step, and banked message keys are bounded globally
   so a peer cannot grow persisted state without limit.
-- **Sealed vault** — AES-GCM over a PBKDF2-derived key, holding the identity and
-  its prekeys.
+- **Sealed vault** — AES-GCM over a PBKDF2-derived key, holding the identity,
+  its prekeys and, if the user turns it on, a TOTP secret. TOTP is optional. A
+  header flag tells the app whether to ask for a code, but the header is not
+  authenticated, so the decrypted contents decide. Vaults sealed before TOTP
+  became optional still open, and still ask for their code.
 - **Envelope, groups, TOTP and call signalling** — the wire formats shared by
   every client, with validation that rejects unknown fields and oversized
   payloads.
@@ -76,7 +79,8 @@ cargo test
 The suite covers the protocol properties that matter rather than line coverage:
 out-of-order delivery across a DH step, replay classification after a state
 reload, tampered ciphertext, prekey rotation with a stale cached bundle, and
-recovery of a session sealed by an older version of the crate.
+recovery of a session sealed by an older version of the crate and of a vault
+sealed before TOTP became optional.
 
 ## Contributing
 
