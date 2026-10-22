@@ -41,6 +41,18 @@ argon2 = { version = "0.5.3", default-features = false, features = ["alloc", "ze
 thiserror = "1"
 chrono = { version = "0.4", features = ["serde"] }
 
+[features]
+# For the tests of the apps that use this crate, never for a build that
+# ships: new version 3 vaults get Argon2id at `KdfParams::TEST` (8 KiB, one
+# pass) instead of 64 MiB, so a test that creates or opens a vault does not
+# pay a real derivation. The header names that KDF with a byte of its own
+# (`kdf = 0xF1`), which a build without this feature refuses before
+# deriving, and `KdfParams::check` refuses its parameters under the real
+# KDF byte, so a vault written this way never opens, nor passes for a real
+# one, in production. A release build with this feature does not compile
+# (lib.rs). An app turns it on only in its dev-dependencies.
+test-kdf = []
+
 [dev-dependencies]
 proptest = "1"
 

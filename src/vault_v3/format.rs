@@ -18,6 +18,10 @@ pub(super) const MAGIC: &[u8; 6] = b"TRINO\0";
 pub(super) const VERSION: u8 = 3;
 /// The `kdf` byte for Argon2id, version 0x13.
 pub(super) const KDF_ARGON2ID: u8 = 1;
+/// The `kdf` byte of a vault written by a build with the `test-kdf` feature:
+/// Argon2id at `KdfParams::TEST`. A build without the feature refuses it
+/// before deriving, as any KDF it does not know.
+pub(super) const KDF_ARGON2ID_TEST: u8 = 0xF1;
 
 pub(super) const HEADER_LEN: usize = 64;
 pub(super) const VERSION_AT: usize = 6;
@@ -76,13 +80,23 @@ impl Header {
         h[..VERSION_AT].copy_from_slice(MAGIC);
         h[VERSION_AT] = VERSION;
         h[FLAGS_AT] = 0;
-        h[KDF_AT] = KDF_ARGON2ID;
+        h[KDF_AT] = self.kdf_byte();
         h[M_AT..T_AT].copy_from_slice(&self.params.m_kib.to_le_bytes());
         h[T_AT..P_AT].copy_from_slice(&self.params.t.to_le_bytes());
         h[P_AT] = self.params.p;
         h[SALT_AT..ID_VAULT_AT].copy_from_slice(&self.salt);
         h[ID_VAULT_AT..RESERVED_AT].copy_from_slice(&self.id_vault);
         h
+    }
+
+    /// The `kdf` byte: Argon2id, or the test KDF for `KdfParams::TEST`,
+    /// which only a build with the `test-kdf` feature writes or reads.
+    fn kdf_byte(&self) -> u8 {
+        if self.params == KdfParams::TEST {
+            KDF_ARGON2ID_TEST
+        } else {
+            KDF_ARGON2ID
+        }
     }
 
     /// Reads and checks the header and the hint of an encoded vault, before
@@ -104,7 +118,8 @@ impl Header {
         if bytes[FLAGS_AT] != 0 {
             return Err(VaultError::UnsupportedFlags(bytes[FLAGS_AT]));
         }
-        if bytes[KDF_AT] != KDF_ARGON2ID {
+        let test_kdf = cfg!(feature = "test-kdf") && bytes[KDF_AT] == KDF_ARGON2ID_TEST;
+        if bytes[KDF_AT] != KDF_ARGON2ID && !test_kdf {
             return Err(VaultError::UnsupportedKdf(bytes[KDF_AT]));
         }
         if bytes[RESERVED_AT..HEADER_LEN].iter().any(|&b| b != 0) {
@@ -115,7 +130,14 @@ impl Header {
             t: u32::from_le_bytes(bytes[T_AT..P_AT].try_into().expect("4 bytes")),
             p: bytes[P_AT],
         };
-        params.check()?;
+        if test_kdf {
+            // The test KDF takes the test parameters and nothing else.
+            if params != KdfParams::TEST {
+                return Err(crate::kdf::KdfError::ParamsOutOfBounds.into());
+            }
+        } else {
+            params.check()?;
+        }
         let hint = match bytes[HINT_AT] {
             0 => false,
             1 => true,

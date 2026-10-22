@@ -16,6 +16,11 @@
 //! Transport (Nostr relays), attachment storage and app state deliberately live
 //! in the client, not here — the protocol does not care how bytes are carried.
 
+// The `test-kdf` feature (Cargo.toml) weakens the vault's KDF for the
+// tests of the apps that use this crate. A release build never has it.
+#[cfg(all(feature = "test-kdf", not(debug_assertions)))]
+compile_error!("the test-kdf feature is for tests only: it must never reach a release build");
+
 pub mod call_signal;
 pub mod crypto;
 pub mod envelope;

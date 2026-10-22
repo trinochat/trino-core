@@ -60,7 +60,8 @@ pub const MAX_KIT_LEN: usize = 1024;
 pub const MAX_TOTP_SECRET_LEN: usize = 64;
 
 /// How the KEK is derived. Production code only ever uses Argon2id; tests
-/// add a fast KDF that counts its calls.
+/// add a fast KDF that counts its calls. A build with the `test-kdf`
+/// feature derives the vaults it writes at `KdfParams::TEST`.
 #[derive(Clone)]
 pub(crate) enum Kdf {
     Argon2id,
@@ -71,6 +72,13 @@ pub(crate) enum Kdf {
 impl Kdf {
     fn derive(&self, passphrase: &str, header: &Header) -> Result<Zeroizing<[u8; 32]>, VaultError> {
         match self {
+            // `Header::parse` lets the test parameters through only in a
+            // build with the `test-kdf` feature.
+            #[cfg(feature = "test-kdf")]
+            Kdf::Argon2id if header.params == KdfParams::TEST => Ok(crate::kdf::argon2id_test(
+                passphrase.as_bytes(),
+                &header.salt,
+            )?),
             Kdf::Argon2id => Ok(crate::kdf::argon2id(
                 passphrase.as_bytes(),
                 &header.salt,
@@ -223,7 +231,7 @@ fn create_with(
 ) -> Result<OpenVault, VaultError> {
     check_app_data(account.app)?;
     let header = Header {
-        params: KdfParams::PRODUCTION,
+        params: KdfParams::for_new_vaults(),
         salt: random_array(),
         id_vault: account.id_vault,
     };
@@ -283,7 +291,7 @@ fn assemble(
 /// moves to the shared block and leaves the body. `app` is the app's new
 /// record (the design rotates the data key here), `shared_app` what the
 /// shared block carries, and `id_vault` the store's name, which a migration
-/// keeps. A new salt, Argon2id at the production parameters, and new MK
+/// keeps. A new salt, Argon2id at `KdfParams::for_new_vaults()`, and new MK
 /// and K2FA; the emergency and recovery slots start as random bytes, as in
 /// every new vault.
 pub fn migrate_to_v3(

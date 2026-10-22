@@ -193,6 +193,7 @@ fn every_v3_vault_has_three_slots_a_shared_block_and_a_body() {
     assert_ne!(slots[0], slots[2]);
 }
 
+#[cfg(not(feature = "test-kdf"))]
 #[test]
 fn the_id_vault_and_parameters_are_in_the_header() {
     let vault = create(None);
@@ -494,6 +495,82 @@ fn real_argon2id_vault_opens_with_its_passphrase_only() {
         unseal_vault_v3(vault.bytes(), OTHER, None).err(),
         Some(VaultError::DecryptionFailed)
     ));
+}
+
+// ---- The test KDF (feature `test-kdf`) --------------------------------------
+
+/// A vault as a `test-kdf` build writes it: the test KDF byte and the test
+/// parameters, made here from a spy vault.
+fn relabelled(bytes: &[u8], kdf: u8, params: KdfParams) -> Vec<u8> {
+    let mut bytes = bytes.to_vec();
+    bytes[KDF_AT] = kdf;
+    bytes[M_AT..T_AT].copy_from_slice(&params.m_kib.to_le_bytes());
+    bytes[T_AT..P_AT].copy_from_slice(&params.t.to_le_bytes());
+    bytes[P_AT] = params.p;
+    bytes
+}
+
+/// Every build that ships is made without `test-kdf`: it writes Argon2id at
+/// the production parameters, and a vault a test build wrote is refused
+/// before any derivation.
+#[cfg(not(feature = "test-kdf"))]
+#[test]
+fn without_test_kdf_a_vault_gets_the_real_kdf_and_refuses_a_test_one() {
+    let identity = create_identity();
+    let vault = create_vault_v3(&account(&identity), None, PASS).unwrap();
+    assert_eq!(vault.params(), KdfParams::PRODUCTION);
+    assert_eq!(vault.bytes()[KDF_AT], KDF_ARGON2ID);
+
+    let test_vault = relabelled(create(None).bytes(), KDF_ARGON2ID_TEST, KdfParams::TEST);
+    let (kdf, count) = spy();
+    assert!(matches!(
+        unseal_with(kdf, &test_vault, PASS, None).err(),
+        Some(VaultError::UnsupportedKdf(KDF_ARGON2ID_TEST))
+    ));
+    assert!(matches!(
+        vault_v3_requires_totp(&test_vault).err(),
+        Some(VaultError::UnsupportedKdf(KDF_ARGON2ID_TEST))
+    ));
+    assert_eq!(count.load(Ordering::SeqCst), 0);
+}
+
+/// Under the real KDF byte, the test parameters are out of bounds: a test
+/// vault relabelled as a real one is refused before deriving too.
+#[test]
+fn the_test_parameters_under_the_real_kdf_byte_are_refused_before_deriving() {
+    let bytes = relabelled(create(None).bytes(), KDF_ARGON2ID, KdfParams::TEST);
+    let (kdf, count) = spy();
+    assert!(matches!(
+        unseal_with(kdf, &bytes, PASS, None).err(),
+        Some(VaultError::Kdf(crate::kdf::KdfError::ParamsOutOfBounds))
+    ));
+    assert_eq!(count.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(feature = "test-kdf")]
+#[test]
+fn with_test_kdf_a_vault_gets_the_test_kdf_and_opens_at_once() {
+    let identity = create_identity();
+    let start = std::time::Instant::now();
+    let vault = create_vault_v3(&account(&identity), None, PASS).unwrap();
+    assert_eq!(vault.params(), KdfParams::TEST);
+    assert_eq!(vault.bytes()[KDF_AT], KDF_ARGON2ID_TEST);
+    let opened = real(unseal_vault_v3(vault.bytes(), PASS, None).unwrap());
+    assert_eq!(opened.identity().ik_dh.pub_bytes, identity.ik_dh.pub_bytes);
+    assert!(matches!(
+        unseal_vault_v3(vault.bytes(), OTHER, None).err(),
+        Some(VaultError::DecryptionFailed)
+    ));
+    assert!(start.elapsed() < std::time::Duration::from_secs(2));
+
+    // The test KDF byte takes only the test parameters.
+    let other = relabelled(vault.bytes(), KDF_ARGON2ID_TEST, KdfParams::PRODUCTION);
+    let (kdf, count) = spy();
+    assert!(matches!(
+        unseal_with(kdf, &other, PASS, None).err(),
+        Some(VaultError::Kdf(crate::kdf::KdfError::ParamsOutOfBounds))
+    ));
+    assert_eq!(count.load(Ordering::SeqCst), 0);
 }
 
 // ---- The emergency key ------------------------------------------------------
@@ -858,7 +935,7 @@ fn a_v2_vault_migrates_to_v3_with_the_totp_secret_in_the_shared_block() {
     assert_eq!(opened.app(), Some(&new_app[..]));
     assert_eq!(opened.shared_app(), SHARED_APP);
     assert_eq!(opened.id_vault(), ID_VAULT);
-    assert_eq!(opened.params(), KdfParams::PRODUCTION);
+    assert_eq!(opened.params(), KdfParams::for_new_vaults());
     assert!(!opened.is_emergency_key(OTHER).unwrap());
 }
 

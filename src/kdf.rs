@@ -48,6 +48,25 @@ impl KdfParams {
         p: 4,
     };
 
+    /// For tests only (the `test-kdf` feature): the least Argon2id takes.
+    /// Far below `MIN_M_KIB`, so `check` refuses it and no vault can ask a
+    /// production build to derive with it.
+    pub const TEST: KdfParams = KdfParams {
+        m_kib: 8,
+        t: 1,
+        p: 1,
+    };
+
+    /// The parameters a new vault gets: `PRODUCTION`, or `TEST` in a build
+    /// with the `test-kdf` feature.
+    pub const fn for_new_vaults() -> KdfParams {
+        if cfg!(feature = "test-kdf") {
+            KdfParams::TEST
+        } else {
+            KdfParams::PRODUCTION
+        }
+    }
+
     /// OWASP's floor, 19 MiB (`m = 19 MiB, t = 2, p = 1`).
     pub const MIN_M_KIB: u32 = 19 * 1024;
     /// 1 GiB: a vault cannot ask for more memory than this.
@@ -79,6 +98,18 @@ pub fn argon2id(
     params.check()?;
     let mut key = Zeroizing::new([0u8; KEY_LEN]);
     argon2id_raw(passphrase, salt, &[], &[], params, &mut key[..])?;
+    Ok(key)
+}
+
+/// Argon2id at `KdfParams::TEST`, which `check` refuses: only a build with
+/// the `test-kdf` feature has it.
+#[cfg(feature = "test-kdf")]
+pub(crate) fn argon2id_test(
+    passphrase: &[u8],
+    salt: &[u8],
+) -> Result<Zeroizing<[u8; KEY_LEN]>, KdfError> {
+    let mut key = Zeroizing::new([0u8; KEY_LEN]);
+    argon2id_raw(passphrase, salt, &[], &[], &KdfParams::TEST, &mut key[..])?;
     Ok(key)
 }
 
@@ -253,6 +284,37 @@ mod tests {
             times[runs / 2],
             times[runs - 1]
         );
+    }
+
+    /// The test parameters can never be asked of a production build: they
+    /// are below the bounds every vault header is checked against.
+    #[test]
+    fn the_test_parameters_never_pass_the_bounds() {
+        assert_eq!(KdfParams::TEST.check(), Err(KdfError::ParamsOutOfBounds));
+        assert_eq!(
+            argon2id(b"pass", &[0; 16], &KdfParams::TEST).err(),
+            Some(KdfError::ParamsOutOfBounds)
+        );
+    }
+
+    /// Without the `test-kdf` feature, which is how every build that ships
+    /// is made, a new vault gets the real parameters.
+    #[cfg(not(feature = "test-kdf"))]
+    #[test]
+    fn without_test_kdf_new_vaults_get_the_production_parameters() {
+        assert_eq!(KdfParams::for_new_vaults(), KdfParams::PRODUCTION);
+    }
+
+    #[cfg(feature = "test-kdf")]
+    #[test]
+    fn with_test_kdf_new_vaults_get_the_test_parameters() {
+        assert_eq!(KdfParams::for_new_vaults(), KdfParams::TEST);
+        let start = std::time::Instant::now();
+        let key = argon2id_test(b"pass", &[7; 16]).unwrap();
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        let mut raw = [0u8; 32];
+        argon2id_raw(b"pass", &[7; 16], &[], &[], &KdfParams::TEST, &mut raw).unwrap();
+        assert_eq!(*key, raw);
     }
 
     /// The bounded entry point is the same Argon2id as the raw one.
