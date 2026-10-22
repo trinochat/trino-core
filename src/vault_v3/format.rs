@@ -53,6 +53,7 @@ pub(super) const BODY_JSON_MAX: usize = BODY_PLAIN_LEN - 4;
 /// What a slot wraps (the type byte, inside the encryption). The emergency
 /// slot is type 2, the recovery kit's (later) type 3 and the redirect type 4.
 pub(super) const SLOT_REAL: u8 = 1;
+pub(super) const SLOT_EMERGENCY: u8 = 2;
 
 pub(super) type SlotBytes = [u8; SLOT_LEN];
 

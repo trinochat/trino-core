@@ -43,8 +43,9 @@ use crate::vault::{check_app_data, VaultError};
 use zeroize::Zeroizing;
 
 use format::{
-    open_slot, random_slot, seal_slot, slot_key, slot_range, Body, Header, Positions, Shared,
-    BODY_AT, HEADER_LEN, HINT_AT, SHARED_AT, SLOT_COUNT, SLOT_REAL,
+    check_len, check_totp_secret, open_slot, random_slot, seal_slot, slot_key, slot_range, Body,
+    Header, Positions, Shared, BODY_AT, HEADER_LEN, HINT_AT, SHARED_AT, SLOT_COUNT, SLOT_EMERGENCY,
+    SLOT_REAL,
 };
 
 /// Every version 3 vault is this long.
@@ -111,12 +112,11 @@ pub struct NewAccount<'a> {
 /// A vault opened with its real passphrase: everything needed to change it
 /// and seal it again without asking for the passphrase.
 pub struct OpenVault {
+    kdf: Kdf,
     header: Header,
     /// The vault as it stands, always `V3_VAULT_LEN` bytes. Each setter
     /// rewrites only its own part.
     bytes: Vec<u8>,
-    // Read by the re-sealing setters of the next step.
-    #[cfg_attr(not(test), allow(dead_code))]
     mk: Zeroizing<[u8; 32]>,
     body: Body,
     shared: Shared,
@@ -126,6 +126,37 @@ pub struct OpenVault {
 pub enum Unlocked {
     /// The real passphrase.
     Real(Box<OpenVault>),
+    /// The emergency key: the app runs the emergency path (design §6).
+    Emergency(Box<EmergencyVault>),
+}
+
+/// A vault opened with its emergency key. It holds K2FA and the shared
+/// block, and nothing that opens the body.
+pub struct EmergencyVault {
+    header: Header,
+    // Read by the emergency path, which builds the empty account from them.
+    #[cfg_attr(not(test), allow(dead_code))]
+    k2fa: Zeroizing<[u8; 32]>,
+    shared: Shared,
+    /// The position of the slot that opened.
+    #[cfg_attr(not(test), allow(dead_code))]
+    position: u8,
+}
+
+impl EmergencyVault {
+    /// The app's data in the shared block: what the empty account inherits,
+    /// and what the network action needs.
+    pub fn shared_app(&self) -> &[u8] {
+        &self.shared.app
+    }
+
+    pub fn totp_secret(&self) -> Option<&[u8]> {
+        self.shared.totp.as_deref().map(Vec::as_slice)
+    }
+
+    pub fn id_vault(&self) -> [u8; ID_VAULT_LEN] {
+        self.header.id_vault
+    }
 }
 
 /// Creates a version 3 vault for a new account.
@@ -180,6 +211,7 @@ fn create_with(
     bytes[SHARED_AT..BODY_AT].copy_from_slice(&shared.seal(&body.k2fa, &header)?);
     bytes[BODY_AT..].copy_from_slice(&body.seal(&mk, &header)?);
     Ok(OpenVault {
+        kdf,
         header,
         bytes,
         mk,
@@ -214,6 +246,7 @@ fn unseal_with(
 
     // Every slot, always; the decision comes after.
     let mut real = None;
+    let mut emergency = None;
     for position in 0..SLOT_COUNT as u8 {
         let opened = open_slot(
             &k_r,
@@ -221,13 +254,30 @@ fn unseal_with(
             position,
             &bytes[slot_range(position)],
         );
-        if let Some((SLOT_REAL, mk)) = opened {
-            real.get_or_insert((position, mk));
+        match opened {
+            Some((SLOT_REAL, mk)) => {
+                real.get_or_insert((position, mk));
+            }
+            Some((SLOT_EMERGENCY, k2fa)) => {
+                emergency.get_or_insert((position, k2fa));
+            }
+            _ => {}
         }
     }
 
+    // The real slot wins (design §2, principle 3).
     let Some((position, mk)) = real else {
-        return Err(VaultError::DecryptionFailed);
+        let Some((position, k2fa)) = emergency else {
+            return Err(VaultError::DecryptionFailed);
+        };
+        let shared = Shared::open(bytes, &k2fa, &header)?;
+        check_totp(&shared, totp_code)?;
+        return Ok(Unlocked::Emergency(Box::new(EmergencyVault {
+            header,
+            k2fa,
+            shared,
+            position,
+        })));
     };
     let body = Body::open(bytes, &mk, &header)?;
     if body.positions.real != position {
@@ -236,6 +286,7 @@ fn unseal_with(
     let shared = Shared::open(bytes, &body.k2fa, &header)?;
     check_totp(&shared, totp_code)?;
     Ok(Unlocked::Real(Box::new(OpenVault {
+        kdf,
         header,
         bytes: bytes.to_vec(),
         mk,
@@ -310,4 +361,166 @@ impl OpenVault {
     pub fn params(&self) -> KdfParams {
         self.header.params
     }
+
+    /// Replaces the identity (a rotated signed prekey, used one-time
+    /// prekeys) and re-seals the body. Slots and shared block stay as they
+    /// are, byte for byte.
+    pub fn set_identity(&mut self, identity: Identity) -> Result<(), VaultError> {
+        let previous = std::mem::replace(&mut self.body.identity, identity);
+        self.write_body()
+            .inspect_err(|_| self.body.identity = previous)
+    }
+
+    /// Replaces the app data in the body.
+    pub fn set_app(&mut self, app: Option<&[u8]>) -> Result<(), VaultError> {
+        check_app_data(app)?;
+        let app = app.map(|a| Zeroizing::new(a.to_vec()));
+        let previous = std::mem::replace(&mut self.body.app, app);
+        self.write_body().inspect_err(|_| self.body.app = previous)
+    }
+
+    /// Replaces the recovery kit field in the body, up to `MAX_KIT_LEN`.
+    pub fn set_kit(&mut self, kit: Option<&[u8]>) -> Result<(), VaultError> {
+        if let Some(kit) = kit {
+            check_len("kit", kit.len(), MAX_KIT_LEN)?;
+        }
+        let kit = kit.map(|k| Zeroizing::new(k.to_vec()));
+        let previous = std::mem::replace(&mut self.body.kit, kit);
+        self.write_body().inspect_err(|_| self.body.kit = previous)
+    }
+
+    /// Turns TOTP on (with a new secret) or off. Rewrites the shared block
+    /// and the hint only: the emergency slot wraps K2FA, not the secret, so
+    /// it is left alone and the change holds for the emergency key too.
+    pub fn set_totp_secret(&mut self, totp_secret: Option<&[u8]>) -> Result<(), VaultError> {
+        check_totp_secret(totp_secret)?;
+        self.shared.totp = totp_secret.map(|t| Zeroizing::new(t.to_vec()));
+        self.write_shared()
+    }
+
+    /// Replaces the app data in the shared block.
+    pub fn set_shared_app(&mut self, shared_app: &[u8]) -> Result<(), VaultError> {
+        check_len("shared app data", shared_app.len(), MAX_SHARED_APP_LEN)?;
+        self.shared.app = Zeroizing::new(shared_app.to_vec());
+        self.write_shared()
+    }
+
+    /// Re-wraps the real slot under `new_passphrase`, same salt and
+    /// parameters, and moves the redirect key `R` to it. One derivation.
+    ///
+    /// Refused with `PassphraseOpensEmergencySlot` if the new passphrase is
+    /// the emergency key. The other two slots are copied byte for byte.
+    pub fn change_passphrase(&mut self, new_passphrase: &str) -> Result<(), VaultError> {
+        let kek = self.kdf.derive(new_passphrase, &self.header)?;
+        let k_r = slot_key(&kek, &self.header.id_vault);
+        let at = self.body.positions.emergency;
+        if let Some((SLOT_EMERGENCY, _)) = open_slot(&k_r, &self.header.id_vault, at, self.slot(at))
+        {
+            return Err(VaultError::PassphraseOpensEmergencySlot);
+        }
+        self.become_real(&kek)
+    }
+
+    /// Writes the emergency slot: K2FA under `emergency_key`, in its own
+    /// position, over whatever was there. `current` must be the passphrase
+    /// that opens this account. Two derivations.
+    ///
+    /// Refused with `EmergencyKeyOpensAnotherSlot` if the emergency key
+    /// opens another slot, which means it is the passphrase.
+    pub fn set_emergency_key(
+        &mut self,
+        current: &str,
+        emergency_key: &str,
+    ) -> Result<(), VaultError> {
+        let current_kek = self.current_kek(current)?;
+        let kek = self.kdf.derive(emergency_key, &self.header)?;
+        if ct_eq(&kek, &current_kek) {
+            return Err(VaultError::EmergencyKeyOpensAnotherSlot);
+        }
+        let k_r = slot_key(&kek, &self.header.id_vault);
+        let id_vault = self.header.id_vault;
+        let positions = self.body.positions;
+        for at in [positions.real, positions.recovery] {
+            if open_slot(&k_r, &id_vault, at, self.slot(at)).is_some() {
+                return Err(VaultError::EmergencyKeyOpensAnotherSlot);
+            }
+        }
+        let slot = seal_slot(
+            &k_r,
+            &id_vault,
+            positions.emergency,
+            SLOT_EMERGENCY,
+            &self.body.k2fa,
+        );
+        self.bytes[slot_range(positions.emergency)].copy_from_slice(&slot);
+        Ok(())
+    }
+
+    /// Fills the emergency slot with random bytes. `current` must be the
+    /// passphrase that opens this account.
+    pub fn remove_emergency_key(&mut self, current: &str) -> Result<(), VaultError> {
+        self.current_kek(current)?;
+        let at = self.body.positions.emergency;
+        self.bytes[slot_range(at)].copy_from_slice(&random_slot());
+        Ok(())
+    }
+
+    /// Whether `candidate` is the emergency key ("Probar", design §8.4).
+    /// Derives once and writes nothing.
+    pub fn is_emergency_key(&self, candidate: &str) -> Result<bool, VaultError> {
+        let kek = self.kdf.derive(candidate, &self.header)?;
+        let k_r = slot_key(&kek, &self.header.id_vault);
+        let at = self.body.positions.emergency;
+        Ok(matches!(
+            open_slot(&k_r, &self.header.id_vault, at, self.slot(at)),
+            Some((SLOT_EMERGENCY, _))
+        ))
+    }
+
+    fn slot(&self, position: u8) -> &[u8] {
+        &self.bytes[slot_range(position)]
+    }
+
+    /// The KEK of `passphrase`, if it opens this account's real slot.
+    fn current_kek(&self, passphrase: &str) -> Result<Zeroizing<[u8; 32]>, VaultError> {
+        let kek = self.kdf.derive(passphrase, &self.header)?;
+        let k_r = slot_key(&kek, &self.header.id_vault);
+        let at = self.body.positions.real;
+        match open_slot(&k_r, &self.header.id_vault, at, self.slot(at)) {
+            Some((SLOT_REAL, mk)) if ct_eq(&mk, &self.mk) => Ok(kek),
+            _ => Err(VaultError::DecryptionFailed),
+        }
+    }
+
+    /// Makes `kek` the real passphrase's: re-wraps the real slot and moves
+    /// the redirect key to it.
+    fn become_real(&mut self, kek: &[u8; 32]) -> Result<(), VaultError> {
+        let k_r = slot_key(kek, &self.header.id_vault);
+        let at = self.body.positions.real;
+        let slot = seal_slot(&k_r, &self.header.id_vault, at, SLOT_REAL, &self.mk);
+        let redirect_pub = redirect::public_key(kek);
+        let previous = std::mem::replace(&mut self.shared.redirect_pub, redirect_pub);
+        self.write_shared()
+            .inspect_err(|_| self.shared.redirect_pub = previous)?;
+        self.bytes[slot_range(at)].copy_from_slice(&slot);
+        Ok(())
+    }
+
+    fn write_body(&mut self) -> Result<(), VaultError> {
+        let sealed = self.body.seal(&self.mk, &self.header)?;
+        self.bytes[BODY_AT..].copy_from_slice(&sealed);
+        Ok(())
+    }
+
+    fn write_shared(&mut self) -> Result<(), VaultError> {
+        let sealed = self.shared.seal(&self.body.k2fa, &self.header)?;
+        self.bytes[SHARED_AT..BODY_AT].copy_from_slice(&sealed);
+        self.bytes[HINT_AT] = u8::from(self.shared.totp.is_some());
+        Ok(())
+    }
+}
+
+/// Compares two keys without stopping at the first difference.
+fn ct_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    a.iter().zip(b).fold(0u8, |diff, (x, y)| diff | (x ^ y)) == 0
 }
