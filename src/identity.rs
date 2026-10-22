@@ -1,3 +1,5 @@
+#![doc = include_str!("../docs/identity.md")]
+
 use crate::crypto::{from_hex, random_array, to_hex, CryptoError};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use secp256k1::{Keypair, Secp256k1};
@@ -41,14 +43,13 @@ pub struct SignedPreKey {
     pub created_at: i64,
 }
 
-/// A signed prekey that is no longer current but is still accepted in
-/// handshakes until `retired_at + SPK_RETENTION_SECS`.
+/// A retired signed prekey, still accepted until `retired_at + SPK_RETENTION_SECS`.
+///
+/// Details: docs/identity.md#spk-retention
 #[derive(Clone, Debug)]
 pub struct RetiredSignedPreKey {
     pub prekey: SignedPreKey,
-    /// When it stopped being current (unix seconds). Retention counts from
-    /// here: until this moment the key was in the bundle we hand out, so it is
-    /// exactly the one peers have cached.
+    /// When it stopped being current (unix seconds); retention counts from here.
     pub retired_at: i64,
 }
 
@@ -67,21 +68,17 @@ pub struct Identity {
     pub one_time_prekeys: Vec<OneTimePreKey>,
     /// Previously current signed prekeys, kept for a grace period.
     ///
-    /// Rotation is what bounds the damage of a leaked signed prekey: without it
-    /// one compromised SPK exposes every initial message ever sent to us.
-    /// Retention is what makes rotation safe here — bundles are exchanged
-    /// out-of-band and cached by the peer, so a peer may legitimately hand us an
-    /// older `spk_id` long after we rotated. Dropping the old key immediately
-    /// would break those peers (and every auto-heal re-handshake from them).
+    /// Details: docs/identity.md#spk-retention
     pub retired_signed_prekeys: Vec<RetiredSignedPreKey>,
 }
 
 /// Generate a fresh signed prekey once the current one is this old.
-pub const SPK_ROTATION_SECS: i64 = 2 * 24 * 60 * 60; // 2 days, as Signal does
-/// Keep a retired signed prekey usable for this long after it stops being
-/// current (measured from `RetiredSignedPreKey::retired_at`, not from creation:
-/// a device that stays locked for weeks rotates late, and the key it retires
-/// then is the one every peer still holds).
+///
+/// Details: docs/identity.md#spk-rotation
+pub const SPK_ROTATION_SECS: i64 = 2 * 24 * 60 * 60; // 2 days
+/// Keep a retired signed prekey usable this long after it stops being current.
+///
+/// Details: docs/identity.md#spk-retention
 pub const SPK_RETENTION_SECS: i64 = 30 * 24 * 60 * 60; // 30 days
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -102,9 +99,9 @@ pub struct PublicBundle {
     pub opk_id: Option<u32>,
     #[serde(rename = "opkPub")]
     pub opk_pub: Option<String>,
-    /// ik_sign signature over (ik_dh_pub || nostr_pub). Binds the DH and Nostr
-    /// keys to the identity key so a MITM can't swap them. Empty on legacy
-    /// bundles (rejected by verify_bundle). See identity_signing_bytes.
+    /// `ik_sign` signature over `ik_dh_pub || nostr_pub`; empty on legacy bundles.
+    ///
+    /// Details: docs/identity.md#identity-binding
     #[serde(rename = "idSig", default)]
     pub id_sig: String,
 }
@@ -173,10 +170,7 @@ pub fn x25519_derive_shared(our_priv: &[u8; 32], peer_pub: &[u8; 32]) -> [u8; 32
     let secret = XSecret::from(*our_priv);
     let peer = XPublicKey::from(*peer_pub);
     let shared = secret.diffie_hellman(&peer);
-    // Defense in depth: a low-order / non-contributory peer key forces a
-    // predictable (attacker-known) shared secret. Reject it by returning random
-    // bytes — the derived session then fails to agree instead of leaking a known
-    // key. The honest path is always contributory, so this never affects it.
+    // Non-contributory peer key: see docs/identity.md#non-contributory-dh
     if !shared.was_contributory() {
         return random_array();
     }
@@ -256,15 +250,9 @@ pub fn verify_bundle(bundle: &PublicBundle) -> bool {
     ed25519_verify(&ik_sign_pub, &spk_pub, &sig)
 }
 
-/// Stricter check: also require that ik_dh_pub + nostr_pub are signed by
-/// ik_sign. Without this a MITM could swap the DH key at first contact and the
-/// fingerprint wouldn't catch it.
+/// `verify_bundle` plus the `id_sig` binding; required for every bundle that becomes a contact.
 ///
-/// Required for EVERY bundle that becomes a contact: pasted/scanned bundles
-/// and group members alike. The admin's roster signature does not vouch for a
-/// member's keys, since it only proves what the admin claims and any contact
-/// can be the admin of a group of their own. Roster v2 therefore carries each
-/// member's own `id_sig`, and `group::validate_roster` checks it with this.
+/// Details: docs/identity.md#identity-binding
 pub fn verify_bundle_binding(bundle: &PublicBundle) -> bool {
     if !verify_bundle(bundle) {
         return false;
@@ -284,9 +272,9 @@ pub fn verify_bundle_binding(bundle: &PublicBundle) -> bool {
     )
 }
 
-/// Look up a signed prekey by id: the current one, or one retired but still
-/// within its retention window. This is what lets a peer holding an older
-/// cached bundle still complete (or re-complete) a handshake.
+/// The signed prekey with this id: the current one or a retired one still held.
+///
+/// Details: docs/identity.md#spk-retention
 pub fn signed_prekey_by_id(identity: &Identity, spk_id: u32) -> Option<&SignedPreKey> {
     if identity.signed_prekey.id == spk_id {
         return Some(&identity.signed_prekey);
@@ -298,12 +286,9 @@ pub fn signed_prekey_by_id(identity: &Identity, spk_id: u32) -> Option<&SignedPr
         .find(|spk| spk.id == spk_id)
 }
 
-/// Rotate the signed prekey if it has aged past `SPK_ROTATION_SECS`, retiring
-/// the outgoing one at `now`, and drop retired keys whose retention
-/// (`SPK_RETENTION_SECS` from retirement) has run out.
+/// Rotates the signed prekey when due and expires retired ones; true if anything changed.
 ///
-/// Returns true when anything changed, so the caller knows to re-seal the vault
-/// and republish its bundle.
+/// Details: docs/identity.md#spk-rotation
 pub fn rotate_signed_prekey_if_due(identity: &mut Identity, now: i64) -> bool {
     let mut changed = false;
 
@@ -329,8 +314,7 @@ pub fn rotate_signed_prekey_if_due(identity: &mut Identity, now: i64) -> bool {
         changed = true;
     }
 
-    // Expire old keys. Forward secrecy only actually improves once the retired
-    // private key is gone, so this half of the job matters as much as rotating.
+    // Expire retired keys: see docs/identity.md#spk-expiry
     let before = identity.retired_signed_prekeys.len();
     identity
         .retired_signed_prekeys
@@ -408,9 +392,7 @@ mod tests {
 
     #[test]
     fn retired_spk_is_kept_for_the_full_window_after_it_is_retired() {
-        // A device left locked for weeks rotates on its next unlock. The key
-        // that was current until that moment is the one every peer holds, so
-        // its retention must start then, not when the key was created.
+        // Retention counts from retirement: see docs/identity.md#spk-retention
         let mut id = create_identity();
         let old_id = id.signed_prekey.id;
         let retired_at = id.signed_prekey.created_at + 40 * 24 * 60 * 60;

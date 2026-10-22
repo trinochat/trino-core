@@ -281,11 +281,8 @@ fn app_data_len_is_valid(len: usize) -> bool {
 }
 
 fn vault_key(passphrase: &str, salt: &[u8; SALT_SIZE]) -> Zeroizing<[u8; 32]> {
-    Zeroizing::new(pbkdf2_sha256(
-        passphrase.as_bytes(),
-        salt,
-        PBKDF2_ITERATIONS,
-    ))
+    // `pbkdf2_sha256` already hands the key back in a Zeroizing buffer.
+    pbkdf2_sha256(passphrase.as_bytes(), salt, PBKDF2_ITERATIONS)
 }
 
 /// The header up to the nonce, as `encode_vault` writes it.
