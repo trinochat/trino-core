@@ -54,6 +54,7 @@ pub(super) const BODY_JSON_MAX: usize = BODY_PLAIN_LEN - 4;
 /// slot is type 2, the recovery kit's (later) type 3 and the redirect type 4.
 pub(super) const SLOT_REAL: u8 = 1;
 pub(super) const SLOT_EMERGENCY: u8 = 2;
+pub(super) const SLOT_REDIRECT: u8 = 4;
 
 pub(super) type SlotBytes = [u8; SLOT_LEN];
 
@@ -148,6 +149,18 @@ impl Positions {
             real: order[0],
             emergency: order[1],
             recovery: order[2],
+        }
+    }
+
+    /// New positions that keep the emergency one where it is: the empty
+    /// account's redirect goes where the emergency slot was (design §3.8.3).
+    pub fn random_keeping_emergency(emergency: u8) -> Positions {
+        let mut others: Vec<u8> = (0..3).filter(|&p| p != emergency).collect();
+        others.shuffle(&mut rand::thread_rng());
+        Positions {
+            real: others[0],
+            emergency,
+            recovery: others[1],
         }
     }
 
@@ -246,6 +259,16 @@ pub(super) fn open_slot(
 ) -> Option<(u8, Zeroizing<[u8; 32]>)> {
     #[cfg(test)]
     super::tests::count_slot_try();
+    open_slot_uncounted(k, id_vault, position, slot)
+}
+
+/// `open_slot`, without the test counter: the redirect opens slots too.
+pub(super) fn open_slot_uncounted(
+    k: &[u8; 32],
+    id_vault: &[u8; 16],
+    position: u8,
+    slot: &[u8],
+) -> Option<(u8, Zeroizing<[u8; 32]>)> {
     let nonce = &slot[..NONCE_SIZE];
     let plain = aes_gcm_decrypt(
         k,

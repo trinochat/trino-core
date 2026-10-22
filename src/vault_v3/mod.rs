@@ -130,16 +130,16 @@ pub enum Unlocked {
     Emergency(Box<EmergencyVault>),
 }
 
-/// A vault opened with its emergency key. It holds K2FA and the shared
-/// block, and nothing that opens the body.
+/// A vault opened with its emergency key. It holds the shared block and the
+/// emergency key's KEK, and nothing that opens the body.
 pub struct EmergencyVault {
+    kdf: Kdf,
     header: Header,
-    // Read by the emergency path, which builds the empty account from them.
-    #[cfg_attr(not(test), allow(dead_code))]
-    k2fa: Zeroizing<[u8; 32]>,
+    /// The emergency key's KEK: the empty account keeps the same salt and
+    /// parameters, so it needs no second derivation.
+    kek: Zeroizing<[u8; 32]>,
     shared: Shared,
     /// The position of the slot that opened.
-    #[cfg_attr(not(test), allow(dead_code))]
     position: u8,
 }
 
@@ -156,6 +156,53 @@ impl EmergencyVault {
 
     pub fn id_vault(&self) -> [u8; ID_VAULT_LEN] {
         self.header.id_vault
+    }
+
+    /// Step E2 of the emergency path (design §6.1 and §3.8), the core's
+    /// part: the vault of the empty account, in memory. Nothing is written;
+    /// the app writes `bytes()` with its two-phase write (E4).
+    ///
+    /// The empty account keeps the salt, the parameters and the KEK of the
+    /// emergency key, which now opens its real slot. It gets a new
+    /// `id_vault` (the app's, which must differ), new MK, K2FA and identity,
+    /// and the TOTP secret of the old shared block. Where the emergency slot
+    /// was goes the redirect: the new MK sealed to the `R` of the old shared
+    /// block, so the real passphrase opens the empty account too (CE-D12,
+    /// design §3.8). The recovery slot is random bytes. No derivation.
+    pub fn into_empty_account(self, account: &NewAccount) -> Result<OpenVault, VaultError> {
+        if account.id_vault == self.header.id_vault {
+            return Err(VaultError::IdVaultReused);
+        }
+        check_app_data(account.app)?;
+        let header = Header {
+            id_vault: account.id_vault,
+            ..self.header
+        };
+        let shared = Shared::new(
+            self.shared.totp.as_deref().map(Vec::as_slice),
+            redirect::public_key(&self.kek),
+            account.shared_app,
+        )?;
+        let mk = Zeroizing::new(random_array::<32>());
+        let positions = Positions::random_keeping_emergency(self.position);
+        let mut slots: [format::SlotBytes; SLOT_COUNT] = std::array::from_fn(|_| random_slot());
+        let k_r = slot_key(&self.kek, &header.id_vault);
+        slots[usize::from(positions.real)] =
+            seal_slot(&k_r, &header.id_vault, positions.real, SLOT_REAL, &mk);
+        slots[usize::from(positions.emergency)] = redirect::seal(
+            &self.shared.redirect_pub,
+            &header.id_vault,
+            positions.emergency,
+            &mk,
+        )?;
+        let body = Body {
+            identity: account.identity.clone(),
+            k2fa: Zeroizing::new(random_array()),
+            app: account.app.map(|a| Zeroizing::new(a.to_vec())),
+            kit: None,
+            positions,
+        };
+        assemble(self.kdf.clone(), header, slots, mk, body, shared)
     }
 }
 
@@ -195,18 +242,27 @@ fn create_with(
         redirect_pub: redirect::public_key(&kek),
         ..shared_draft
     };
+    let mut slots: [format::SlotBytes; SLOT_COUNT] = std::array::from_fn(|_| random_slot());
+    let real = body.positions.real;
+    let k_r = slot_key(&kek, &header.id_vault);
+    slots[usize::from(real)] = seal_slot(&k_r, &header.id_vault, real, SLOT_REAL, &mk);
+    assemble(kdf, header, slots, mk, body, shared)
+}
 
+/// Lays out a vault from its parts.
+fn assemble(
+    kdf: Kdf,
+    header: Header,
+    slots: [format::SlotBytes; SLOT_COUNT],
+    mk: Zeroizing<[u8; 32]>,
+    body: Body,
+    shared: Shared,
+) -> Result<OpenVault, VaultError> {
     let mut bytes = vec![0u8; V3_VAULT_LEN];
     bytes[..HEADER_LEN].copy_from_slice(&header.encode());
     bytes[HINT_AT] = u8::from(shared.totp.is_some());
-    let k_r = slot_key(&kek, &header.id_vault);
-    for position in 0..SLOT_COUNT as u8 {
-        let slot = if position == body.positions.real {
-            seal_slot(&k_r, &header.id_vault, position, SLOT_REAL, &mk)
-        } else {
-            random_slot()
-        };
-        bytes[slot_range(position)].copy_from_slice(&slot);
+    for (position, slot) in (0u8..).zip(&slots) {
+        bytes[slot_range(position)].copy_from_slice(slot);
     }
     bytes[SHARED_AT..BODY_AT].copy_from_slice(&shared.seal(&body.k2fa, &header)?);
     bytes[BODY_AT..].copy_from_slice(&body.seal(&mk, &header)?);
@@ -280,17 +336,19 @@ fn unseal_with(
     let (header, _hint) = Header::parse(bytes)?;
     let kek = kdf.derive(passphrase, &header)?;
     let k_r = slot_key(&kek, &header.id_vault);
+    let r = redirect::secret_key(&kek);
+    let r_pub = redirect::public_key(&kek);
 
-    // Every slot, always; the decision comes after.
+    // Every slot, both ways, always; the decision comes after (design §3.8.3).
     let mut real = None;
+    let mut redirected = None;
     let mut emergency = None;
     for position in 0..SLOT_COUNT as u8 {
-        let opened = open_slot(
-            &k_r,
-            &header.id_vault,
-            position,
-            &bytes[slot_range(position)],
-        );
+        let slot = &bytes[slot_range(position)];
+        let opened = open_slot(&k_r, &header.id_vault, position, slot);
+        if let Some(mk) = redirect::open(&r, &r_pub, &header.id_vault, position, slot) {
+            redirected.get_or_insert((position, mk));
+        }
         match opened {
             Some((SLOT_REAL, mk)) => {
                 real.get_or_insert((position, mk));
@@ -302,22 +360,31 @@ fn unseal_with(
         }
     }
 
-    // The real slot wins (design §2, principle 3).
-    let Some((position, mk)) = real else {
+    // The real slot wins (design §2, principle 3), then the redirect, which
+    // is the real passphrase too (CE-D12), then the emergency key.
+    let real = real.map(|(at, mk)| (at, mk, false));
+    let redirected = redirected.map(|(at, mk)| (at, mk, true));
+    let Some((position, mk, via_redirect)) = real.or(redirected) else {
         let Some((position, k2fa)) = emergency else {
             return Err(VaultError::DecryptionFailed);
         };
         let shared = Shared::open(bytes, &k2fa, &header)?;
         check_totp(&shared, totp_code)?;
         return Ok(Unlocked::Emergency(Box::new(EmergencyVault {
+            kdf,
             header,
-            k2fa,
+            kek,
             shared,
             position,
         })));
     };
     let body = Body::open(bytes, &mk, &header)?;
-    if body.positions.real != position {
+    let expected = if via_redirect {
+        body.positions.emergency
+    } else {
+        body.positions.real
+    };
+    if expected != position {
         return Err(VaultError::BadPayload);
     }
     let shared = Shared::open(bytes, &body.k2fa, &header)?;
@@ -469,7 +536,7 @@ impl OpenVault {
         current: &str,
         emergency_key: &str,
     ) -> Result<(), VaultError> {
-        let current_kek = self.current_kek(current)?;
+        let (current_kek, via_redirect) = self.current_kek(current)?;
         let kek = self.kdf.derive(emergency_key, &self.header)?;
         if ct_eq(&kek, &current_kek) {
             return Err(VaultError::EmergencyKeyOpensAnotherSlot);
@@ -489,6 +556,10 @@ impl OpenVault {
             SLOT_EMERGENCY,
             &self.body.k2fa,
         );
+        if via_redirect {
+            // The passphrase typed in Settings becomes the real one (§3.8.5).
+            self.become_real(&current_kek)?;
+        }
         self.bytes[slot_range(positions.emergency)].copy_from_slice(&slot);
         Ok(())
     }
@@ -496,7 +567,10 @@ impl OpenVault {
     /// Fills the emergency slot with random bytes. `current` must be the
     /// passphrase that opens this account.
     pub fn remove_emergency_key(&mut self, current: &str) -> Result<(), VaultError> {
-        self.current_kek(current)?;
+        let (current_kek, via_redirect) = self.current_kek(current)?;
+        if via_redirect {
+            self.become_real(&current_kek)?;
+        }
         let at = self.body.positions.emergency;
         self.bytes[slot_range(at)].copy_from_slice(&random_slot());
         Ok(())
@@ -518,13 +592,24 @@ impl OpenVault {
         &self.bytes[slot_range(position)]
     }
 
-    /// The KEK of `passphrase`, if it opens this account's real slot.
-    fn current_kek(&self, passphrase: &str) -> Result<Zeroizing<[u8; 32]>, VaultError> {
+    /// The KEK of `passphrase`, if it opens this account: through the real
+    /// slot, or through the redirect (then `true`).
+    fn current_kek(&self, passphrase: &str) -> Result<(Zeroizing<[u8; 32]>, bool), VaultError> {
         let kek = self.kdf.derive(passphrase, &self.header)?;
-        let k_r = slot_key(&kek, &self.header.id_vault);
-        let at = self.body.positions.real;
-        match open_slot(&k_r, &self.header.id_vault, at, self.slot(at)) {
-            Some((SLOT_REAL, mk)) if ct_eq(&mk, &self.mk) => Ok(kek),
+        let id_vault = &self.header.id_vault;
+        let positions = self.body.positions;
+        let k_r = slot_key(&kek, id_vault);
+        let real = open_slot(&k_r, id_vault, positions.real, self.slot(positions.real));
+        if let Some((SLOT_REAL, mk)) = real {
+            if ct_eq(&mk, &self.mk) {
+                return Ok((kek, false));
+            }
+        }
+        let r = redirect::secret_key(&kek);
+        let r_pub = redirect::public_key(&kek);
+        let at = positions.emergency;
+        match redirect::open(&r, &r_pub, id_vault, at, self.slot(at)) {
+            Some(mk) if ct_eq(&mk, &self.mk) => Ok((kek, true)),
             _ => Err(VaultError::DecryptionFailed),
         }
     }

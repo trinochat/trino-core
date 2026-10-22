@@ -508,7 +508,6 @@ fn the_real_passphrase_opens_the_real_slot_and_the_emergency_key_the_emergency_s
     assert_eq!(e.shared_app(), SHARED_APP);
     assert_eq!(e.id_vault(), ID_VAULT);
     assert_eq!(e.position, vault.body.positions.emergency);
-    assert_eq!(*e.k2fa, *vault.body.k2fa);
 }
 
 /// [5], with an emergency key set.
@@ -937,4 +936,401 @@ fn two_migrations_of_the_same_vault_share_nothing_but_the_identity() {
     assert_ne!(a.header.salt, b.header.salt);
     assert_ne!(*a.mk, *b.mk);
     assert_ne!(*a.body.k2fa, *b.body.k2fa);
+}
+
+// ---- The emergency path and the redirect (CE-D12) ----------------------------
+
+thread_local! {
+    /// Redirect openings tried, on this thread.
+    static REDIRECT_TRIES: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Called by `redirect::open` in test builds.
+pub(super) fn count_redirect_try() {
+    REDIRECT_TRIES.with(|n| n.set(n.get() + 1));
+}
+
+fn redirect_tries() -> usize {
+    REDIRECT_TRIES.with(Cell::get)
+}
+
+const NEW_ID: [u8; ID_VAULT_LEN] = [0x22; ID_VAULT_LEN];
+const NEW_APP: &[u8] = &[0xb6; 60];
+const NEW_SHARED: &[u8] = b"{\"name\":\"Ana\",\"inherited\":true}";
+const SECOND_KEY: &str = "another key for another bad day";
+
+fn empty_account(identity: &Identity) -> NewAccount<'_> {
+    NewAccount {
+        identity,
+        app: Some(NEW_APP),
+        shared_app: NEW_SHARED,
+        id_vault: NEW_ID,
+    }
+}
+
+/// Runs E2 on `bytes` with the emergency key: the empty account's vault,
+/// and its identity.
+fn run_emergency_path(bytes: &[u8], code: Option<&str>) -> (OpenVault, Identity) {
+    let identity = create_identity();
+    let e = emergency(unseal(bytes, EMERGENCY, code).unwrap());
+    let empty = e.into_empty_account(&empty_account(&identity)).unwrap();
+    (empty, identity)
+}
+
+/// [63]
+#[test]
+fn after_the_emergency_path_the_real_passphrase_opens_the_empty_account() {
+    let secret = generate_totp_secret();
+    let old = with_emergency(Some(&secret));
+    let code = totp_now(&secret);
+    let (empty, identity) = run_emergency_path(old.bytes(), Some(&code));
+
+    for passphrase in [PASS, EMERGENCY] {
+        assert!(matches!(
+            unseal(empty.bytes(), passphrase, None).err(),
+            Some(VaultError::TotpRequired)
+        ));
+        assert!(matches!(
+            unseal(empty.bytes(), passphrase, Some(&wrong_code(&secret))).err(),
+            Some(VaultError::InvalidTotp)
+        ));
+        let opened = real(unseal(empty.bytes(), passphrase, Some(&code)).unwrap());
+        assert_eq!(
+            opened.identity().ik_sign.pub_bytes,
+            identity.ik_sign.pub_bytes,
+            "{passphrase}"
+        );
+        assert_eq!(opened.id_vault(), NEW_ID);
+        assert_eq!(opened.app(), Some(NEW_APP));
+        assert_eq!(opened.shared_app(), NEW_SHARED);
+        assert_eq!(opened.totp_secret(), Some(secret.as_slice()));
+        assert_eq!(opened.kit(), None);
+    }
+    assert!(matches!(
+        unseal(empty.bytes(), OTHER, Some(&code)).err(),
+        Some(VaultError::DecryptionFailed)
+    ));
+}
+
+/// E2 keeps the salt and parameters, changes `id_vault`, all three slots and
+/// every key, and derives nothing.
+#[test]
+fn the_empty_account_keeps_the_salt_and_changes_everything_else() {
+    let old = with_emergency(None);
+    let e = emergency(unseal(old.bytes(), EMERGENCY, None).unwrap());
+    let derived = match &e.kdf {
+        Kdf::Spy(count) => count.clone(),
+        Kdf::Argon2id => panic!("not a spy"),
+    };
+    let before = derived.load(Ordering::SeqCst);
+    let identity = create_identity();
+    let empty = e.into_empty_account(&empty_account(&identity)).unwrap();
+    assert_eq!(derived.load(Ordering::SeqCst), before, "E2 derived a key");
+
+    assert_eq!(empty.bytes().len(), V3_VAULT_LEN);
+    assert_eq!(empty.header.salt, old.header.salt);
+    assert_eq!(empty.header.params, old.header.params);
+    assert_eq!(empty.header.id_vault, NEW_ID);
+    let (a, b) = (parts(old.bytes()), parts(empty.bytes()));
+    for at in 0..3 {
+        assert_ne!(a.slots[at], b.slots[at], "slot {at}");
+    }
+    // No two slots alike, the random one included.
+    assert_ne!(b.slots[0], b.slots[1]);
+    assert_ne!(b.slots[1], b.slots[2]);
+    assert_ne!(b.slots[0], b.slots[2]);
+    assert_ne!(*empty.mk, *old.mk);
+    assert_ne!(*empty.body.k2fa, *old.body.k2fa);
+    // The redirect sits where the emergency slot was.
+    assert_eq!(empty.body.positions.emergency, old.body.positions.emergency);
+}
+
+#[test]
+fn the_empty_account_needs_a_new_id_vault() {
+    let old = with_emergency(None);
+    let e = emergency(unseal(old.bytes(), EMERGENCY, None).unwrap());
+    let identity = create_identity();
+    let same = NewAccount {
+        id_vault: ID_VAULT,
+        ..empty_account(&identity)
+    };
+    assert!(matches!(
+        e.into_empty_account(&same).err(),
+        Some(VaultError::IdVaultReused)
+    ));
+}
+
+/// [64]
+#[test]
+fn the_redirect_slot_is_as_long_as_any_slot_and_hides_its_ephemeral_key() {
+    let old = with_emergency(None);
+    let r_pub = old.shared.redirect_pub;
+    let mut high_bits = 0;
+    let runs = 48;
+    for _ in 0..runs {
+        // Each emergency path comes with a new id_vault, and the mask
+        // depends on it.
+        let id_vault: [u8; ID_VAULT_LEN] = random_array();
+        let identity = create_identity();
+        let e = emergency(unseal(old.bytes(), EMERGENCY, None).unwrap());
+        let empty = e
+            .into_empty_account(&NewAccount {
+                id_vault,
+                ..empty_account(&identity)
+            })
+            .unwrap();
+        let at = empty.body.positions.emergency;
+        let slot = &empty.bytes()[slot_range(at)];
+        assert_eq!(slot.len(), SLOT_LEN);
+        let lead: [u8; 32] = slot[..32].try_into().unwrap();
+        let mask = redirect::mask(&r_pub, &id_vault, at);
+        let ephemeral: Vec<u8> = lead.iter().zip(mask.iter()).map(|(l, m)| l ^ m).collect();
+        assert_ne!(&lead[..], &ephemeral[..]);
+        // An X25519 public key never sets its top bit; the lead does half
+        // the time, like random bytes.
+        assert_eq!(ephemeral[31] & 0x80, 0);
+        high_bits += usize::from(lead[31] >> 7);
+    }
+    assert!(
+        (8..=40).contains(&high_bits),
+        "{high_bits} of {runs} leads set the top bit"
+    );
+}
+
+/// [65]
+#[test]
+fn unseal_derives_once_and_tries_both_ways_on_all_three_slots() {
+    let old = with_emergency(None);
+    let (empty, _) = run_emergency_path(old.bytes(), None);
+    for bytes in [old.bytes(), empty.bytes()] {
+        for passphrase in [PASS, EMERGENCY, OTHER] {
+            let (kdf, count) = spy();
+            reset_slot_tries();
+            REDIRECT_TRIES.with(|n| n.set(0));
+            let _ = unseal_with(kdf, bytes, passphrase, None);
+            assert_eq!(count.load(Ordering::SeqCst), 1, "{passphrase}");
+            assert_eq!(slot_tries(), 3, "{passphrase}");
+            assert_eq!(redirect_tries(), 3, "{passphrase}");
+        }
+    }
+}
+
+/// [66]: a copy of the disk from before, and the emergency key, give the
+/// shared block, whose only new field is the public `R`.
+#[test]
+fn an_old_copy_and_the_emergency_key_give_only_the_public_redirect_key() {
+    let old = with_emergency(None);
+    let copy = old.bytes().to_vec();
+    let (empty, _) = run_emergency_path(old.bytes(), None);
+
+    let e = emergency(unseal(&copy, EMERGENCY, None).unwrap());
+    let kek_pass = spy_kek(&old.header, PASS);
+    assert_eq!(e.shared.redirect_pub, redirect::public_key(&kek_pass));
+    // With the emergency key's KEK, the old copy opens only the emergency
+    // slot (K2FA), and no slot of the new vault opens as a redirect.
+    let kek_e = spy_kek(&old.header, EMERGENCY);
+    let k_r = slot_key(&kek_e, &ID_VAULT);
+    let opened: Vec<u8> = (0..3u8)
+        .filter_map(|at| open_slot(&k_r, &ID_VAULT, at, &copy[slot_range(at)]).map(|(t, _)| t))
+        .collect();
+    assert_eq!(opened, vec![SLOT_EMERGENCY]);
+    let r_e = redirect::secret_key(&kek_e);
+    let r_e_pub = redirect::public_key(&kek_e);
+    for at in 0..3u8 {
+        assert!(
+            redirect::open(&r_e, &r_e_pub, &NEW_ID, at, &empty.bytes()[slot_range(at)]).is_none()
+        );
+    }
+}
+
+/// [67]: the flaw of the first idea (design §3.8.1). After a passphrase
+/// change, the redirect follows the new passphrase.
+#[test]
+fn changing_the_passphrase_moves_the_redirect_to_the_new_one() {
+    let mut old = with_emergency(None);
+    old.change_passphrase(NEW_PASS).unwrap();
+    let (empty, identity) = run_emergency_path(old.bytes(), None);
+    let opened = real(unseal(empty.bytes(), NEW_PASS, None).unwrap());
+    assert_eq!(
+        opened.identity().ik_sign.pub_bytes,
+        identity.ik_sign.pub_bytes
+    );
+    assert!(matches!(
+        unseal(empty.bytes(), PASS, None).err(),
+        Some(VaultError::DecryptionFailed)
+    ));
+}
+
+/// [68]
+#[test]
+fn setting_an_emergency_key_in_the_empty_account_replaces_the_redirect() {
+    let old = with_emergency(None);
+    let (empty, _) = run_emergency_path(old.bytes(), None);
+    let mut opened = real(unseal(empty.bytes(), EMERGENCY, None).unwrap());
+    opened.set_emergency_key(EMERGENCY, SECOND_KEY).unwrap();
+    assert!(matches!(
+        unseal(opened.bytes(), PASS, None).err(),
+        Some(VaultError::DecryptionFailed)
+    ));
+    real(unseal(opened.bytes(), EMERGENCY, None).unwrap());
+    emergency(unseal(opened.bytes(), SECOND_KEY, None).unwrap());
+}
+
+/// [69]
+#[test]
+fn configuring_from_the_old_passphrase_makes_it_the_real_one() {
+    let old = with_emergency(None);
+    let (empty, identity) = run_emergency_path(old.bytes(), None);
+    let mut opened = real(unseal(empty.bytes(), PASS, None).unwrap());
+    opened.set_emergency_key(PASS, SECOND_KEY).unwrap();
+    let again = real(unseal(opened.bytes(), PASS, None).unwrap());
+    assert_eq!(
+        again.identity().ik_sign.pub_bytes,
+        identity.ik_sign.pub_bytes
+    );
+    assert!(matches!(
+        unseal(opened.bytes(), EMERGENCY, None).err(),
+        Some(VaultError::DecryptionFailed)
+    ));
+    emergency(unseal(opened.bytes(), SECOND_KEY, None).unwrap());
+    // R now belongs to the passphrase that was typed.
+    assert_eq!(
+        again.shared.redirect_pub,
+        redirect::public_key(&spy_kek(&again.header, PASS))
+    );
+}
+
+/// [70]
+#[test]
+fn the_emergency_key_never_opens_the_redirect_slot() {
+    let old = with_emergency(None);
+    let (empty, _) = run_emergency_path(old.bytes(), None);
+    let at = empty.body.positions.emergency;
+    let slot = &empty.bytes()[slot_range(at)];
+    let kek_e = spy_kek(&empty.header, EMERGENCY);
+    let k_r = slot_key(&kek_e, &NEW_ID);
+    assert!(open_slot(&k_r, &NEW_ID, at, slot).is_none());
+    let r_e = redirect::secret_key(&kek_e);
+    assert!(redirect::open(&r_e, &redirect::public_key(&kek_e), &NEW_ID, at, slot).is_none());
+    let kek_p = spy_kek(&empty.header, PASS);
+    let r_p = redirect::secret_key(&kek_p);
+    assert!(redirect::open(&r_p, &redirect::public_key(&kek_p), &NEW_ID, at, slot).is_some());
+}
+
+/// [71]: a planted slot with a low-order ephemeral key would open for any
+/// key derived from `R`, whatever the passphrase; it opens for none.
+#[test]
+fn a_slot_with_a_low_order_point_opens_for_no_passphrase() {
+    let mut vault = create(None);
+    let kek = spy_kek(&vault.header, OTHER);
+    let r_pub = redirect::public_key(&kek);
+    let at = vault.body.positions.emergency;
+    let mask = redirect::mask(&r_pub, &ID_VAULT, at);
+    let zero_point = [0u8; 32];
+    let lead: [u8; 32] = std::array::from_fn(|i| zero_point[i] ^ mask[i]);
+    let k = redirect::seal_key(&[0u8; 32], &zero_point, &r_pub, &ID_VAULT);
+    let planted = seal_slot_with_lead(&k, lead, &ID_VAULT, at, 4, &vault.mk);
+    vault.bytes[slot_range(at)].copy_from_slice(&planted);
+    assert!(matches!(
+        unseal(vault.bytes(), OTHER, None).err(),
+        Some(VaultError::DecryptionFailed)
+    ));
+    real(unseal(vault.bytes(), PASS, None).unwrap());
+}
+
+/// [72]
+#[test]
+fn the_redirect_key_does_not_depend_on_the_id_vault() {
+    let vault = create(None);
+    let moved = Header {
+        id_vault: NEW_ID,
+        ..vault.header
+    };
+    let a = redirect::public_key(&spy_kek(&vault.header, PASS));
+    let b = redirect::public_key(&spy_kek(&moved, PASS));
+    assert_eq!(a, b);
+    assert_eq!(a, vault.shared.redirect_pub);
+}
+
+/// [73]
+#[test]
+fn removing_the_emergency_key_in_the_empty_account_ends_the_redirect() {
+    let old = with_emergency(None);
+    let (empty, _) = run_emergency_path(old.bytes(), None);
+
+    let mut from_key = real(unseal(empty.bytes(), EMERGENCY, None).unwrap());
+    from_key.remove_emergency_key(EMERGENCY).unwrap();
+    real(unseal(from_key.bytes(), EMERGENCY, None).unwrap());
+    assert!(matches!(
+        unseal(from_key.bytes(), PASS, None).err(),
+        Some(VaultError::DecryptionFailed)
+    ));
+
+    let mut from_pass = real(unseal(empty.bytes(), PASS, None).unwrap());
+    from_pass.remove_emergency_key(PASS).unwrap();
+    real(unseal(from_pass.bytes(), PASS, None).unwrap());
+    assert!(matches!(
+        unseal(from_pass.bytes(), EMERGENCY, None).err(),
+        Some(VaultError::DecryptionFailed)
+    ));
+}
+
+/// Changing the passphrase in the empty account keeps the redirect: the
+/// session cannot tell what the emergency position holds (§3.8.5).
+#[test]
+fn a_passphrase_change_in_the_empty_account_keeps_the_redirect() {
+    let old = with_emergency(None);
+    let (empty, _) = run_emergency_path(old.bytes(), None);
+    let mut opened = real(unseal(empty.bytes(), EMERGENCY, None).unwrap());
+    opened.change_passphrase(NEW_PASS).unwrap();
+    real(unseal(opened.bytes(), NEW_PASS, None).unwrap());
+    real(unseal(opened.bytes(), PASS, None).unwrap());
+    assert!(matches!(
+        unseal(opened.bytes(), EMERGENCY, None).err(),
+        Some(VaultError::DecryptionFailed)
+    ));
+}
+
+/// A second emergency path, from a key set in the empty account, redirects
+/// to the passphrase of the empty account at that time.
+#[test]
+fn a_second_emergency_path_redirects_to_the_empty_accounts_passphrase() {
+    let old = with_emergency(None);
+    let (empty, _) = run_emergency_path(old.bytes(), None);
+    let mut opened = real(unseal(empty.bytes(), EMERGENCY, None).unwrap());
+    opened.set_emergency_key(EMERGENCY, SECOND_KEY).unwrap();
+    let e = emergency(unseal(opened.bytes(), SECOND_KEY, None).unwrap());
+    let identity = create_identity();
+    let second = e
+        .into_empty_account(&NewAccount {
+            id_vault: [0x33; ID_VAULT_LEN],
+            ..empty_account(&identity)
+        })
+        .unwrap();
+    real(unseal(second.bytes(), EMERGENCY, None).unwrap());
+    real(unseal(second.bytes(), SECOND_KEY, None).unwrap());
+    assert!(matches!(
+        unseal(second.bytes(), PASS, None).err(),
+        Some(VaultError::DecryptionFailed)
+    ));
+}
+
+/// The whole path with the real Argon2id and the public API.
+#[test]
+fn real_argon2id_emergency_path_and_redirect() {
+    let identity = create_identity();
+    let mut vault = create_vault_v3(&account(&identity), None, PASS).unwrap();
+    vault.set_emergency_key(PASS, EMERGENCY).unwrap();
+    let Unlocked::Emergency(e) = unseal_vault_v3(vault.bytes(), EMERGENCY, None).unwrap() else {
+        panic!("expected the emergency path");
+    };
+    let fresh = create_identity();
+    let empty = e.into_empty_account(&empty_account(&fresh)).unwrap();
+    for passphrase in [PASS, EMERGENCY] {
+        let Unlocked::Real(opened) = unseal_vault_v3(empty.bytes(), passphrase, None).unwrap()
+        else {
+            panic!("expected the empty account");
+        };
+        assert_eq!(opened.identity().ik_sign.pub_bytes, fresh.ik_sign.pub_bytes);
+    }
 }
