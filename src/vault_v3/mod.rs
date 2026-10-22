@@ -1,0 +1,313 @@
+//! The version 3 vault: Argon2id, three fixed slots, a shared block and a
+//! padded body, in a file of one fixed size.
+//!
+//! Design: `research_notes/Clave de emergencia/diseno.md` §3 to §6, with the
+//! CE-D12 addendum (§3.8). Layout (`format.rs`):
+//!
+//! ```text
+//! header, 64 bytes       "TRINO\0" | version 3 | flags 0 | kdf 1 (Argon2id)
+//!                        | m_kib u32 | t u32 | p u8 | salt 16 | id_vault 16 | zeros 14
+//! hint, 1 byte           0 or 1: whether to show the TOTP field. Not authenticated
+//! slot[0..3], 81 bytes   lead 32 | AES-256-GCM(type u8 | key 32) | tag 16
+//! shared block, 8 KiB    nonce 12 | AES-256-GCM(TOTP secret, redirect key, app) | tag 16
+//! body, the rest         nonce 12 | AES-256-GCM(len u32 | JSON | zeros) | tag 16
+//! ```
+//!
+//! The whole file is always `V3_VAULT_LEN` bytes, whatever it holds: nothing
+//! in it says whether an emergency key or a recovery kit exists, how many
+//! prekeys the identity has, or how long the app's data is.
+//!
+//! **Keys.** The passphrase goes through Argon2id once per attempt, with the
+//! salt and parameters of the header, into the KEK. From the KEK come the
+//! slot key and the redirect key pair (`redirect.rs`). A slot wraps either
+//! the body key MK (the real slot) or K2FA (the emergency slot). MK opens the
+//! body, which holds the identity, K2FA, the app data, the kit and the
+//! position of each slot. K2FA opens the shared block, which holds the TOTP
+//! secret, the public redirect key and what the app wants the empty account
+//! to inherit.
+//!
+//! **Unlocking** derives once and tries every slot, always all three, so the
+//! work up to the decision is the same for any passphrase.
+
+mod format;
+mod redirect;
+
+#[cfg(test)]
+mod tests;
+
+use crate::crypto::random_array;
+use crate::identity::Identity;
+use crate::kdf::KdfParams;
+use crate::totp::is_totp_code_valid;
+use crate::vault::{check_app_data, VaultError};
+use zeroize::Zeroizing;
+
+use format::{
+    open_slot, random_slot, seal_slot, slot_key, slot_range, Body, Header, Positions, Shared,
+    BODY_AT, HEADER_LEN, HINT_AT, SHARED_AT, SLOT_COUNT, SLOT_REAL,
+};
+
+/// Every version 3 vault is this long.
+pub const V3_VAULT_LEN: usize = 32 * 1024;
+/// The bytes of `id_vault`, the name of the account's store on this device.
+pub const ID_VAULT_LEN: usize = 16;
+/// The most the app can keep in the shared block, in bytes.
+pub const MAX_SHARED_APP_LEN: usize = format::SHARED_APP_CAPACITY;
+/// The most the recovery kit field holds, in bytes.
+pub const MAX_KIT_LEN: usize = 1024;
+/// The longest TOTP secret the shared block holds, in bytes.
+pub const MAX_TOTP_SECRET_LEN: usize = 64;
+
+/// How the KEK is derived. Production code only ever uses Argon2id; tests
+/// add a fast KDF that counts its calls.
+#[derive(Clone)]
+pub(crate) enum Kdf {
+    Argon2id,
+    #[cfg(test)]
+    Spy(std::sync::Arc<std::sync::atomic::AtomicUsize>),
+}
+
+impl Kdf {
+    fn derive(&self, passphrase: &str, header: &Header) -> Result<Zeroizing<[u8; 32]>, VaultError> {
+        match self {
+            Kdf::Argon2id => Ok(crate::kdf::argon2id(
+                passphrase.as_bytes(),
+                &header.salt,
+                &header.params,
+            )?),
+            #[cfg(test)]
+            Kdf::Spy(count) => {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let p = header.params;
+                let info = [
+                    &b"spy kdf"[..],
+                    &p.m_kib.to_le_bytes(),
+                    &p.t.to_le_bytes(),
+                    &[p.p],
+                ]
+                .concat();
+                let okm =
+                    crate::crypto::hkdf_expand(passphrase.as_bytes(), &header.salt, &info, 32)?;
+                let mut kek = Zeroizing::new([0u8; 32]);
+                kek.copy_from_slice(&okm);
+                Ok(kek)
+            }
+        }
+    }
+}
+
+/// What a new vault holds besides its passphrase and TOTP secret.
+pub struct NewAccount<'a> {
+    pub identity: &'a Identity,
+    /// The app's data in the body: 1 to `MAX_APP_DATA_LEN` bytes.
+    pub app: Option<&'a [u8]>,
+    /// The app's data in the shared block, up to `MAX_SHARED_APP_LEN` bytes:
+    /// what an empty account made by the emergency path inherits.
+    pub shared_app: &'a [u8],
+    /// The name of the account's store; the header carries it.
+    pub id_vault: [u8; ID_VAULT_LEN],
+}
+
+/// A vault opened with its real passphrase: everything needed to change it
+/// and seal it again without asking for the passphrase.
+pub struct OpenVault {
+    header: Header,
+    /// The vault as it stands, always `V3_VAULT_LEN` bytes. Each setter
+    /// rewrites only its own part.
+    bytes: Vec<u8>,
+    // Read by the re-sealing setters of the next step.
+    #[cfg_attr(not(test), allow(dead_code))]
+    mk: Zeroizing<[u8; 32]>,
+    body: Body,
+    shared: Shared,
+}
+
+/// What `unseal_vault_v3` opened.
+pub enum Unlocked {
+    /// The real passphrase.
+    Real(Box<OpenVault>),
+}
+
+/// Creates a version 3 vault for a new account.
+pub fn create_vault_v3(
+    account: &NewAccount,
+    totp_secret: Option<&[u8]>,
+    passphrase: &str,
+) -> Result<OpenVault, VaultError> {
+    create_with(Kdf::Argon2id, account, totp_secret, passphrase)
+}
+
+fn create_with(
+    kdf: Kdf,
+    account: &NewAccount,
+    totp_secret: Option<&[u8]>,
+    passphrase: &str,
+) -> Result<OpenVault, VaultError> {
+    check_app_data(account.app)?;
+    let header = Header {
+        params: KdfParams::PRODUCTION,
+        salt: random_array(),
+        id_vault: account.id_vault,
+    };
+    // Checked before the derivation, which is the slow part.
+    let shared_draft = Shared::new(totp_secret, [0; 32], account.shared_app)?;
+    let kek = kdf.derive(passphrase, &header)?;
+    let mk = Zeroizing::new(random_array::<32>());
+    let body = Body {
+        identity: account.identity.clone(),
+        k2fa: Zeroizing::new(random_array()),
+        app: account.app.map(|a| Zeroizing::new(a.to_vec())),
+        kit: None,
+        positions: Positions::random(),
+    };
+    let shared = Shared {
+        redirect_pub: redirect::public_key(&kek),
+        ..shared_draft
+    };
+
+    let mut bytes = vec![0u8; V3_VAULT_LEN];
+    bytes[..HEADER_LEN].copy_from_slice(&header.encode());
+    bytes[HINT_AT] = u8::from(shared.totp.is_some());
+    let k_r = slot_key(&kek, &header.id_vault);
+    for position in 0..SLOT_COUNT as u8 {
+        let slot = if position == body.positions.real {
+            seal_slot(&k_r, &header.id_vault, position, SLOT_REAL, &mk)
+        } else {
+            random_slot()
+        };
+        bytes[slot_range(position)].copy_from_slice(&slot);
+    }
+    bytes[SHARED_AT..BODY_AT].copy_from_slice(&shared.seal(&body.k2fa, &header)?);
+    bytes[BODY_AT..].copy_from_slice(&body.seal(&mk, &header)?);
+    Ok(OpenVault {
+        header,
+        bytes,
+        mk,
+        body,
+        shared,
+    })
+}
+
+/// Opens a version 3 vault.
+///
+/// Derives the KEK once, tries all three slots, and decides: the real slot
+/// wins. A passphrase that opens nothing fails with `DecryptionFailed`, the
+/// same as a version 2 vault. With TOTP on, `TotpRequired` without a code and
+/// `InvalidTotp` with a wrong one, checked against the shared block.
+pub fn unseal_vault_v3(
+    bytes: &[u8],
+    passphrase: &str,
+    totp_code: Option<&str>,
+) -> Result<Unlocked, VaultError> {
+    unseal_with(Kdf::Argon2id, bytes, passphrase, totp_code)
+}
+
+fn unseal_with(
+    kdf: Kdf,
+    bytes: &[u8],
+    passphrase: &str,
+    totp_code: Option<&str>,
+) -> Result<Unlocked, VaultError> {
+    let (header, _hint) = Header::parse(bytes)?;
+    let kek = kdf.derive(passphrase, &header)?;
+    let k_r = slot_key(&kek, &header.id_vault);
+
+    // Every slot, always; the decision comes after.
+    let mut real = None;
+    for position in 0..SLOT_COUNT as u8 {
+        let opened = open_slot(
+            &k_r,
+            &header.id_vault,
+            position,
+            &bytes[slot_range(position)],
+        );
+        if let Some((SLOT_REAL, mk)) = opened {
+            real.get_or_insert((position, mk));
+        }
+    }
+
+    let Some((position, mk)) = real else {
+        return Err(VaultError::DecryptionFailed);
+    };
+    let body = Body::open(bytes, &mk, &header)?;
+    if body.positions.real != position {
+        return Err(VaultError::BadPayload);
+    }
+    let shared = Shared::open(bytes, &body.k2fa, &header)?;
+    check_totp(&shared, totp_code)?;
+    Ok(Unlocked::Real(Box::new(OpenVault {
+        header,
+        bytes: bytes.to_vec(),
+        mk,
+        body,
+        shared,
+    })))
+}
+
+/// The same check on either path, against the shared block's secret.
+fn check_totp(shared: &Shared, totp_code: Option<&str>) -> Result<(), VaultError> {
+    if let Some(secret) = &shared.totp {
+        let code = totp_code.ok_or(VaultError::TotpRequired)?;
+        if !is_totp_code_valid(code, secret) {
+            return Err(VaultError::InvalidTotp);
+        }
+    }
+    Ok(())
+}
+
+/// Whether opening this vault will ask for a TOTP code: the hint byte, read
+/// after the header checks and without deriving anything.
+///
+/// **A UI hint only,** as `vault::vault_requires_totp`: it is outside the
+/// authenticated data, so that turning TOTP on or off never has to touch the
+/// emergency slot. The shared block decides.
+pub fn vault_v3_requires_totp(bytes: &[u8]) -> Result<bool, VaultError> {
+    Ok(Header::parse(bytes)?.1)
+}
+
+/// The format version of an encoded vault, 1 to 3, after its magic bytes.
+/// The app reads it to choose between opening and migrating.
+pub fn vault_version(bytes: &[u8]) -> Result<u8, VaultError> {
+    if bytes.len() <= format::VERSION_AT {
+        return Err(VaultError::Corrupted);
+    }
+    if &bytes[..format::VERSION_AT] != format::MAGIC {
+        return Err(VaultError::BadMagic);
+    }
+    Ok(bytes[format::VERSION_AT])
+}
+
+impl OpenVault {
+    /// The vault as it stands now, to write to disk.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn identity(&self) -> &Identity {
+        &self.body.identity
+    }
+
+    pub fn app(&self) -> Option<&[u8]> {
+        self.body.app.as_deref().map(Vec::as_slice)
+    }
+
+    pub fn kit(&self) -> Option<&[u8]> {
+        self.body.kit.as_deref().map(Vec::as_slice)
+    }
+
+    pub fn totp_secret(&self) -> Option<&[u8]> {
+        self.shared.totp.as_deref().map(Vec::as_slice)
+    }
+
+    pub fn shared_app(&self) -> &[u8] {
+        &self.shared.app
+    }
+
+    pub fn id_vault(&self) -> [u8; ID_VAULT_LEN] {
+        self.header.id_vault
+    }
+
+    pub fn params(&self) -> KdfParams {
+        self.header.params
+    }
+}

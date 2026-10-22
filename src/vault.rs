@@ -64,6 +64,7 @@ use crate::identity::{
     decode_array_32, decode_array_64, Identity, IdentityError, KeyPair, OneTimePreKey,
     RetiredSignedPreKey, SignedPreKey,
 };
+use crate::kdf::KdfError;
 use crate::totp::is_totp_code_valid;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -113,6 +114,30 @@ pub enum VaultError {
     /// `MAX_APP_DATA_LEN`.
     #[error("app data must be 1 to {max} bytes, got {0}", max = MAX_APP_DATA_LEN)]
     InvalidAppData(usize),
+    /// The version 3 header names a KDF this version does not know.
+    #[error("unsupported vault kdf: {0}")]
+    UnsupportedKdf(u8),
+    /// The KDF refused its parameters (out of bounds) or failed.
+    #[error("kdf: {0}")]
+    Kdf(#[from] KdfError),
+    /// A field of a version 3 vault does not fit its fixed size.
+    #[error("{what} is {len} bytes, more than the {max} a version 3 vault holds")]
+    TooLarge {
+        what: &'static str,
+        len: usize,
+        max: usize,
+    },
+    /// The new passphrase would open the emergency slot: it is the
+    /// emergency key. The user picks another one.
+    #[error("the new passphrase opens the emergency slot")]
+    PassphraseOpensEmergencySlot,
+    /// The emergency key would open another slot, which is the passphrase
+    /// itself (or the recovery slot's key).
+    #[error("the emergency key opens another slot")]
+    EmergencyKeyOpensAnotherSlot,
+    /// The empty account was given the `id_vault` of the vault it replaces.
+    #[error("the empty account needs a new id_vault")]
+    IdVaultReused,
     #[error("crypto: {0}")]
     Crypto(#[from] CryptoError),
     #[error("identity: {0}")]
@@ -175,7 +200,7 @@ struct SerializedOneTimePreKey {
 
 #[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 #[serde(rename_all = "camelCase")]
-struct SerializedIdentity {
+pub(crate) struct SerializedIdentity {
     ik_sign: SerializedKeyPair,
     ik_dh: SerializedKeyPair,
     nostr: SerializedKeyPair,
@@ -267,7 +292,7 @@ fn check_header(version: u8, flags: u8) -> Result<(), VaultError> {
     Ok(())
 }
 
-fn check_app_data(app: Option<&[u8]>) -> Result<(), VaultError> {
+pub(crate) fn check_app_data(app: Option<&[u8]>) -> Result<(), VaultError> {
     match app {
         Some(app) if !app_data_len_is_valid(app.len()) => {
             Err(VaultError::InvalidAppData(app.len()))
@@ -354,7 +379,7 @@ fn open_with_key(blob: &SealedVault, key: &[u8; 32]) -> Result<UnsealedVault, Va
         }
     }
 
-    deserialize_identity(serialized)
+    deserialize_identity(&serialized)
 }
 
 pub fn encode_vault(v: &SealedVault) -> Vec<u8> {
@@ -392,7 +417,7 @@ pub fn decode_vault(bytes: &[u8]) -> Result<SealedVault, VaultError> {
     })
 }
 
-fn serialize_identity(
+pub(crate) fn serialize_identity(
     identity: &Identity,
     totp_secret: Option<&[u8]>,
     app: Option<&[u8]>,
@@ -432,7 +457,7 @@ fn serialize_identity(
     }
 }
 
-fn deserialize_identity(s: SerializedIdentity) -> Result<UnsealedVault, VaultError> {
+pub(crate) fn deserialize_identity(s: &SerializedIdentity) -> Result<UnsealedVault, VaultError> {
     let identity = Identity {
         ik_sign: kp_from_ser(&s.ik_sign)?,
         ik_dh: kp_from_ser(&s.ik_dh)?,
@@ -664,7 +689,7 @@ mod tests {
         let raw = serde_json::to_value(serialize_identity(&id, None, None)).unwrap();
         assert!(raw.get("totpSecret").is_none());
         assert!(raw.get("app").is_none());
-        let opened = deserialize_identity(serde_json::from_value(raw).unwrap()).unwrap();
+        let opened = deserialize_identity(&serde_json::from_value(raw).unwrap()).unwrap();
         assert_eq!(opened.totp_secret, None);
     }
 
@@ -795,7 +820,7 @@ mod tests {
         let id = rotated_twice();
         let raw =
             serde_json::to_value(serialize_identity(&id, Some(b"totp".as_slice()), None)).unwrap();
-        let opened = deserialize_identity(serde_json::from_value(raw).unwrap()).unwrap();
+        let opened = deserialize_identity(&serde_json::from_value(raw).unwrap()).unwrap();
         assert_eq!(retirement_times(&opened.identity), retirement_times(&id));
     }
 
@@ -810,7 +835,7 @@ mod tests {
         for retired in raw["retiredSignedPreKeys"].as_array_mut().unwrap() {
             retired.as_object_mut().unwrap().remove("retiredAt");
         }
-        let opened = deserialize_identity(serde_json::from_value(raw).unwrap()).unwrap();
+        let opened = deserialize_identity(&serde_json::from_value(raw).unwrap()).unwrap();
         assert_eq!(retirement_times(&opened.identity), retirement_times(&id));
     }
 

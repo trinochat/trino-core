@@ -93,7 +93,7 @@ pub fn aes_gcm_encrypt(
 }
 
 /// Encrypts under a caller-chosen nonce. Private: a nonce reused under one key breaks GCM.
-fn aes_gcm_encrypt_with_nonce(
+pub(crate) fn aes_gcm_encrypt_with_nonce(
     key: &[u8],
     nonce: &[u8; NONCE_SIZE],
     plaintext: &[u8],

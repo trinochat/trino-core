@@ -25,4 +25,5 @@ pub mod kdf;
 pub mod ratchet;
 pub mod totp;
 pub mod vault;
+pub mod vault_v3;
 pub mod x3dh;
