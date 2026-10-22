@@ -43,3 +43,19 @@ chrono = { version = "0.4", features = ["serde"] }
 
 [dev-dependencies]
 proptest = "1"
+
+# Tests derive real keys: PBKDF2 with 600 000 rounds for the version 1 and 2
+# vaults, and Argon2id at 64 MiB for version 3. Unoptimized, a single
+# derivation takes seconds to tens of seconds, so the hash crates are built
+# optimized in dev and test builds too. Profiles apply only when trino-core
+# is the root package; an app that depends on it keeps its own.
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.hmac]
+opt-level = 3
+[profile.dev.package.pbkdf2]
+opt-level = 3
