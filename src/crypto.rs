@@ -180,6 +180,15 @@ mod tests {
         assert_eq!(out.len(), 48);
     }
 
+    // concat builds the associated data of the ratchet and of X3DH: dropping or
+    // reordering a part would unbind a header or an identity key.
+    #[test]
+    fn concat_joins_every_part_in_order() {
+        assert_eq!(concat(&[&b"ab"[..], b"", b"cde", b"f"]), b"abcdef");
+        assert_eq!(concat(&[&b"cde"[..], b"ab"]), b"cdeab");
+        assert!(concat(&[]).is_empty());
+    }
+
     #[test]
     fn pbkdf2_deterministic() {
         let a = pbkdf2_sha256(b"pass", b"salt", 1000);

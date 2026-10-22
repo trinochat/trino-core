@@ -663,6 +663,118 @@ mod tests {
         assert!(reloaded.skipped_key_order.is_empty());
     }
 
+    // Known answers for the key schedule. The agreement tests above cannot see
+    // a KDF that returns a constant, since both sides would agree on it. These
+    // come from an independent HKDF-SHA256 (RFC 5869 over Python's hmac and
+    // hashlib, self-checked against RFC 5869 test case 1), not from this crate.
+    //
+    // kdf_rk(rk = [1; 32], dh_out = [2; 32]): salt = rk, ikm = dh_out.
+    const KAT_RK: &str = "353408393104ce34bf5bea3518ecb79bfc27e528b8e8ad3132df124bb5966a5e";
+    const KAT_RK_CK: &str = "1f3bdc1f17629e2ace21db6155efdeaaad3d7bf8a608afa7db2e6eedf87eac9f";
+    // kdf_ck(ck = [3; 32]), and kdf_ck of its next chain key.
+    const KAT_CK_NEXT: &str = "ce601e9741de7516ca58df66f43441b3673acfd297690e0bf65696df0d142206";
+    const KAT_CK_MK: &str = "b53c5bf1d4e78dbba078cb9119ea0e4629459a97532fef5e0eb3ecb1ff6ff716";
+    const KAT_CK2_NEXT: &str = "b7517debc36130a945043905067ed5c5dea36840b91696772ac3d5c82b543f7a";
+    const KAT_CK2_MK: &str = "e29116967bb9b9af98f4b4ab524f508473c74c87c8430a56a2e0b78ba41b4617";
+
+    #[test]
+    fn kdf_rk_matches_known_vector() {
+        let (rk, ck) = kdf_rk(&[1; 32], &[2; 32]).unwrap();
+        assert_eq!(hex::encode(rk), KAT_RK);
+        assert_eq!(hex::encode(ck), KAT_RK_CK);
+    }
+
+    #[test]
+    fn kdf_ck_matches_known_vectors() {
+        let (next, mk) = kdf_ck(&[3; 32]).unwrap();
+        assert_eq!(hex::encode(next), KAT_CK_NEXT);
+        assert_eq!(hex::encode(mk), KAT_CK_MK);
+        let (next2, mk2) = kdf_ck(&next).unwrap();
+        assert_eq!(hex::encode(next2), KAT_CK2_NEXT);
+        assert_eq!(hex::encode(mk2), KAT_CK2_MK);
+    }
+
+    #[test]
+    fn header_encodes_as_dh_pub_then_pn_then_n_big_endian() {
+        let dh: Vec<u8> = (0u8..32).collect();
+        let header = MessageHeader {
+            dh_pub: hex::encode(&dh),
+            pn: 0x0102_0304,
+            n: 0x0506_0708,
+        };
+        let mut expected = dh.clone();
+        expected.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(encode_header(&header).unwrap(), expected);
+    }
+
+    /// Opens a message with nothing but the known message key and an AD built
+    /// by hand (caller AD, then dh_pub || pn || n), so the ratchet's own KDF,
+    /// header encoding and `concat` are all checked against outside values.
+    fn open_with(mk_hex: &str, msg: &EncryptedMessage, ad: &[u8], dh_pub: &[u8; 32]) -> Vec<u8> {
+        let mut full_ad = ad.to_vec();
+        full_ad.extend_from_slice(dh_pub);
+        full_ad.extend_from_slice(&msg.header.pn.to_be_bytes());
+        full_ad.extend_from_slice(&msg.header.n.to_be_bytes());
+        aes_gcm_decrypt(
+            &hex::decode(mk_hex).unwrap(),
+            &hex::decode(&msg.ciphertext).unwrap(),
+            &hex::decode(&msg.nonce).unwrap(),
+            Some(&full_ad),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn encrypt_uses_the_known_chain_and_binds_ad_and_header() {
+        let (mut alice, _bob, ad) = pair();
+        alice.sending_chain_key = Some([3; 32]);
+        alice.previous_sending_chain_length = 7;
+        let dh_pub = alice.dhs.pub_bytes;
+
+        let m0 = ratchet_encrypt(&mut alice, b"first", &ad).unwrap();
+        assert_eq!((m0.header.pn, m0.header.n), (7, 0));
+        assert_eq!(hex::encode(alice.sending_chain_key.unwrap()), KAT_CK_NEXT);
+        assert_eq!(open_with(KAT_CK_MK, &m0, &ad, &dh_pub), b"first");
+
+        let m1 = ratchet_encrypt(&mut alice, b"second", &ad).unwrap();
+        assert_eq!(m1.header.n, 1);
+        assert_eq!(hex::encode(alice.sending_chain_key.unwrap()), KAT_CK2_NEXT);
+        assert_eq!(open_with(KAT_CK2_MK, &m1, &ad, &dh_pub), b"second");
+    }
+
+    #[test]
+    fn header_and_associated_data_are_authenticated() {
+        let (mut alice, mut bob, ad) = pair();
+        let m0 = ratchet_encrypt(&mut alice, b"0", &ad).unwrap();
+        assert_eq!(ratchet_decrypt(&mut bob, &m0, &ad).unwrap(), b"0");
+
+        // Same chain, so pn does not take part in deriving the key: only the
+        // AD can tell the forged header apart.
+        let m1 = ratchet_encrypt(&mut alice, b"x", &ad).unwrap();
+        let mut other_pn = m1.clone();
+        other_pn.header.pn += 1;
+        assert!(ratchet_decrypt(&mut bob, &other_pn, &ad).is_err());
+        assert!(ratchet_decrypt(&mut bob, &m1, b"another AD").is_err());
+        assert_eq!(ratchet_decrypt(&mut bob, &m1, &ad).unwrap(), b"x");
+    }
+
+    #[test]
+    fn chain_and_root_keys_move() {
+        let (mut alice, mut bob, ad) = pair();
+        let ck_before = alice.sending_chain_key.unwrap();
+        let m0 = ratchet_encrypt(&mut alice, b"0", &ad).unwrap();
+        let ck_after_one = alice.sending_chain_key.unwrap();
+        ratchet_encrypt(&mut alice, b"1", &ad).unwrap();
+        assert_ne!(ck_before, ck_after_one);
+        assert_ne!(ck_after_one, alice.sending_chain_key.unwrap());
+
+        // Bob's first message from Alice is a DH step: two kdf_rk calls.
+        let rk_before = bob.root_key;
+        ratchet_decrypt(&mut bob, &m0, &ad).unwrap();
+        assert_ne!(bob.root_key, rk_before);
+        assert_ne!(bob.sending_chain_key, bob.receiving_chain_key);
+    }
+
     #[test]
     fn max_skip_guard_rejects_absurd_gap() {
         let (mut alice, mut bob, ad) = pair();
