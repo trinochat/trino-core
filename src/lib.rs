@@ -21,6 +21,7 @@ pub mod crypto;
 pub mod envelope;
 pub mod group;
 pub mod identity;
+pub mod kdf;
 pub mod ratchet;
 pub mod totp;
 pub mod vault;

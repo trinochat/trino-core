@@ -34,6 +34,9 @@ rand = "0.8"
 hex = "0.4"
 base64 = "0.22"
 zeroize = { version = "1", features = ["derive"] }
+# The vault's passphrase KDF. MIT OR Apache-2.0. Its `zeroize` feature wipes
+# the crate's temporaries; kdf.rs wipes the memory matrix itself.
+argon2 = { version = "0.5.3", default-features = false, features = ["alloc", "zeroize"] }
 
 thiserror = "1"
 chrono = { version = "0.4", features = ["serde"] }
