@@ -39,7 +39,7 @@ use crate::crypto::random_array;
 use crate::identity::Identity;
 use crate::kdf::KdfParams;
 use crate::totp::is_totp_code_valid;
-use crate::vault::{check_app_data, VaultError};
+use crate::vault::{check_app_data, UnsealedVault, VaultError};
 use zeroize::Zeroizing;
 
 use format::{
@@ -218,6 +218,43 @@ fn create_with(
         body,
         shared,
     })
+}
+
+/// Moves a version 1 or 2 vault to version 3 (design §3.7), once the app has
+/// opened it with `vault::unseal_vault`.
+///
+/// The identity and the TOTP secret come from the old vault; the secret
+/// moves to the shared block and leaves the body. `app` is the app's new
+/// record (the design rotates the data key here), `shared_app` what the
+/// shared block carries, and `id_vault` the store's name, which a migration
+/// keeps. A new salt, Argon2id at the production parameters, and new MK
+/// and K2FA; the emergency and recovery slots start as random bytes, as in
+/// every new vault.
+pub fn migrate_to_v3(
+    old: &UnsealedVault,
+    passphrase: &str,
+    app: Option<&[u8]>,
+    shared_app: &[u8],
+    id_vault: [u8; ID_VAULT_LEN],
+) -> Result<OpenVault, VaultError> {
+    migrate_with(Kdf::Argon2id, old, passphrase, app, shared_app, id_vault)
+}
+
+fn migrate_with(
+    kdf: Kdf,
+    old: &UnsealedVault,
+    passphrase: &str,
+    app: Option<&[u8]>,
+    shared_app: &[u8],
+    id_vault: [u8; ID_VAULT_LEN],
+) -> Result<OpenVault, VaultError> {
+    let account = NewAccount {
+        identity: &old.identity,
+        app,
+        shared_app,
+        id_vault,
+    };
+    create_with(kdf, &account, old.totp_secret.as_deref(), passphrase)
 }
 
 /// Opens a version 3 vault.

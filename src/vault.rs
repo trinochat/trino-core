@@ -557,7 +557,7 @@ fn kp_from_ser(s: &SerializedKeyPair) -> Result<KeyPair, VaultError> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::identity::create_identity;
     use crate::totp::{generate_totp_secret, totp_now};
@@ -885,13 +885,13 @@ mod tests {
         5ae93761280ab6868b7d4157cd566f3a7f8bd8dce05d108d396a64b429f0ec502373478d634f7384
         bd8bf0fde31c4ed84189d12415b2f53c6c5b8f577099c47c90e0
     ";
-    const OLD_VAULT_PASSPHRASE: &str = "trino-core 1bac851 fixture";
+    pub(crate) const OLD_VAULT_PASSPHRASE: &str = "trino-core 1bac851 fixture";
     /// RFC 6238's SHA-1 seed, so the tests can compute a valid code.
-    const OLD_VAULT_TOTP_SECRET: &[u8] = b"12345678901234567890";
-    const OLD_VAULT_IK_SIGN_PUB: &str =
+    pub(crate) const OLD_VAULT_TOTP_SECRET: &[u8] = b"12345678901234567890";
+    pub(crate) const OLD_VAULT_IK_SIGN_PUB: &str =
         "84aa175b86e7d4eb0f1b84afd20e4654174c929e699c8e548ee535ae6292d06a";
 
-    fn old_vault() -> Vec<u8> {
+    pub(crate) fn old_vault() -> Vec<u8> {
         hex::decode(OLD_VAULT_HEX.split_whitespace().collect::<String>()).unwrap()
     }
 
@@ -1346,7 +1346,7 @@ mod tests {
 
     /// With TOTP (the RFC 6238 seed, `OLD_VAULT_TOTP_SECRET`); app data
     /// `01 02 .. 20`.
-    const V2_VAULT_HEX: &str = "
+    pub(crate) const V2_VAULT_HEX: &str = "
         5452494e4f00 02 00
         03f0212ed18709eca055c9fe50d3473e
         dc0cc2c76dcbe69bfea4a4e4
@@ -1381,12 +1381,12 @@ mod tests {
         723be342060bf06bc342f6d90d11eeb4501042c8a7644b34358168da70e915b6f0a3912e7f1efd6f
         6e6ccdae1ad343dffd69c88e43ed20c5be7397
     ";
-    const V2_VAULT_PASSPHRASE: &str = "trino-core vault v2 fixture";
-    const V2_VAULT_IK_SIGN_PUB: &str =
+    pub(crate) const V2_VAULT_PASSPHRASE: &str = "trino-core vault v2 fixture";
+    pub(crate) const V2_VAULT_IK_SIGN_PUB: &str =
         "909e237bfe6a53460dc9cb099b8ec2d00cf4ba23c5e20b33bdef46bd95e15c83";
 
     /// Without TOTP; 48 bytes of app data, `30 31 .. 5f`.
-    const V2_VAULT_NO_TOTP_HEX: &str = "
+    pub(crate) const V2_VAULT_NO_TOTP_HEX: &str = "
         5452494e4f00 02 01
         5418bd3ae1762019ae459a9fc7c67214
         2765e7b9086505a8e4f1f1a7
@@ -1420,11 +1420,11 @@ mod tests {
         30424856453804e24304116177c17c018f8f1007aec8109331fc75b40003aa38a3a7547301bf7f99
         b945fc2fad978719fe120d0e4616e7c61c440c545b84961dc6ac2e6c904ff85f676969
     ";
-    const V2_VAULT_NO_TOTP_PASSPHRASE: &str = "trino-core vault v2 fixture, no TOTP";
-    const V2_VAULT_NO_TOTP_IK_SIGN_PUB: &str =
+    pub(crate) const V2_VAULT_NO_TOTP_PASSPHRASE: &str = "trino-core vault v2 fixture, no TOTP";
+    pub(crate) const V2_VAULT_NO_TOTP_IK_SIGN_PUB: &str =
         "e95155e0b833b6330c4a51b5800d6472750dd64d3b30b7defb9c3df6350514a9";
 
-    fn golden(hex_block: &str) -> Vec<u8> {
+    pub(crate) fn golden(hex_block: &str) -> Vec<u8> {
         hex::decode(hex_block.split_whitespace().collect::<String>()).unwrap()
     }
 

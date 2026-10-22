@@ -816,3 +816,125 @@ fn the_largest_body_fits_in_32_kib() {
     assert!(fitting >= 80, "{fitting}");
     assert_eq!(vault.identity().one_time_prekeys.len(), fitting);
 }
+
+// ---- Migration from version 2 -------------------------------------------------
+
+/// [15], with the version 2 vector of 3421e16.
+#[test]
+fn a_v2_vault_migrates_to_v3_with_the_totp_secret_in_the_shared_block() {
+    use crate::vault::tests::{
+        golden, OLD_VAULT_TOTP_SECRET, V2_VAULT_HEX, V2_VAULT_IK_SIGN_PUB, V2_VAULT_PASSPHRASE,
+    };
+    let v2 = crate::vault::decode_vault(&golden(V2_VAULT_HEX)).unwrap();
+    let code = totp_now(OLD_VAULT_TOTP_SECRET);
+    let old = crate::vault::unseal_vault(&v2, V2_VAULT_PASSPHRASE, Some(&code)).unwrap();
+    let new_app = [0x42u8; 60];
+    let migrated = migrate_with(
+        spy().0,
+        &old,
+        V2_VAULT_PASSPHRASE,
+        Some(&new_app),
+        SHARED_APP,
+        ID_VAULT,
+    )
+    .unwrap();
+
+    let bytes = migrated.bytes();
+    assert_eq!(bytes.len(), V3_VAULT_LEN);
+    assert_eq!(vault_version(bytes).unwrap(), 3);
+    assert!(vault_v3_requires_totp(bytes).unwrap());
+    let json = open_body_json(bytes, &migrated.mk, &migrated.header).unwrap();
+    assert!(!String::from_utf8(json.to_vec()).unwrap().contains("totp"));
+
+    assert!(matches!(
+        unseal(bytes, V2_VAULT_PASSPHRASE, None).err(),
+        Some(VaultError::TotpRequired)
+    ));
+    let opened = real(unseal(bytes, V2_VAULT_PASSPHRASE, Some(&code)).unwrap());
+    assert_eq!(
+        hex::encode(opened.identity().ik_sign.pub_bytes),
+        V2_VAULT_IK_SIGN_PUB
+    );
+    assert_eq!(opened.totp_secret(), Some(OLD_VAULT_TOTP_SECRET));
+    assert_eq!(opened.app(), Some(&new_app[..]));
+    assert_eq!(opened.shared_app(), SHARED_APP);
+    assert_eq!(opened.id_vault(), ID_VAULT);
+    assert_eq!(opened.params(), KdfParams::PRODUCTION);
+    assert!(!opened.is_emergency_key(OTHER).unwrap());
+}
+
+#[test]
+fn a_v2_vault_without_totp_migrates_without_a_secret() {
+    use crate::vault::tests::{
+        golden, V2_VAULT_NO_TOTP_HEX, V2_VAULT_NO_TOTP_IK_SIGN_PUB, V2_VAULT_NO_TOTP_PASSPHRASE,
+    };
+    let v2 = crate::vault::decode_vault(&golden(V2_VAULT_NO_TOTP_HEX)).unwrap();
+    let old = crate::vault::unseal_vault(&v2, V2_VAULT_NO_TOTP_PASSPHRASE, None).unwrap();
+    let migrated = migrate_with(
+        spy().0,
+        &old,
+        V2_VAULT_NO_TOTP_PASSPHRASE,
+        old.app.as_deref().map(Vec::as_slice),
+        &[],
+        ID_VAULT,
+    )
+    .unwrap();
+    assert!(!vault_v3_requires_totp(migrated.bytes()).unwrap());
+    let opened = real(unseal(migrated.bytes(), V2_VAULT_NO_TOTP_PASSPHRASE, None).unwrap());
+    assert_eq!(
+        hex::encode(opened.identity().ik_sign.pub_bytes),
+        V2_VAULT_NO_TOTP_IK_SIGN_PUB
+    );
+    assert_eq!(opened.totp_secret(), None);
+    assert_eq!(opened.app(), old.app.as_deref().map(Vec::as_slice));
+}
+
+/// A version 1 vault (1bac851) migrates the same way.
+#[test]
+fn a_v1_vault_migrates_to_v3() {
+    use crate::vault::tests::{
+        old_vault, OLD_VAULT_IK_SIGN_PUB, OLD_VAULT_PASSPHRASE, OLD_VAULT_TOTP_SECRET,
+    };
+    let v1 = crate::vault::decode_vault(&old_vault()).unwrap();
+    let code = totp_now(OLD_VAULT_TOTP_SECRET);
+    let old = crate::vault::unseal_vault(&v1, OLD_VAULT_PASSPHRASE, Some(&code)).unwrap();
+    let migrated = migrate_with(
+        spy().0,
+        &old,
+        OLD_VAULT_PASSPHRASE,
+        Some(APP),
+        SHARED_APP,
+        ID_VAULT,
+    )
+    .unwrap();
+    let opened = real(unseal(migrated.bytes(), OLD_VAULT_PASSPHRASE, Some(&code)).unwrap());
+    assert_eq!(
+        hex::encode(opened.identity().ik_sign.pub_bytes),
+        OLD_VAULT_IK_SIGN_PUB
+    );
+    assert_eq!(opened.totp_secret(), Some(OLD_VAULT_TOTP_SECRET));
+}
+
+/// Every migrated vault starts with new salt, keys and slot positions, like
+/// any new vault.
+#[test]
+fn two_migrations_of_the_same_vault_share_nothing_but_the_identity() {
+    use crate::vault::tests::{golden, V2_VAULT_NO_TOTP_HEX, V2_VAULT_NO_TOTP_PASSPHRASE};
+    let v2 = crate::vault::decode_vault(&golden(V2_VAULT_NO_TOTP_HEX)).unwrap();
+    let old = crate::vault::unseal_vault(&v2, V2_VAULT_NO_TOTP_PASSPHRASE, None).unwrap();
+    let migrate = || {
+        migrate_with(
+            spy().0,
+            &old,
+            V2_VAULT_NO_TOTP_PASSPHRASE,
+            Some(APP),
+            &[],
+            ID_VAULT,
+        )
+        .unwrap()
+    };
+    let (a, b) = (migrate(), migrate());
+    assert_ne!(a.header.salt, b.header.salt);
+    assert_ne!(*a.mk, *b.mk);
+    assert_ne!(*a.body.k2fa, *b.body.k2fa);
+}
