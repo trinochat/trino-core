@@ -1,0 +1,2 @@
+# Test vectors are checked by hash: keep their bytes the same on every checkout.
+tests/vectors/** text eol=lf
