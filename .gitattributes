@@ -1,2 +1,4 @@
 # Test vectors are checked by hash: keep their bytes the same on every checkout.
 tests/vectors/** text eol=lf
+# The BIP-39 word lists are checked by hash: keep their bytes on every checkout.
+src/kit/wordlists/** text eol=lf
