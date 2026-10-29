@@ -6,8 +6,9 @@
 //! pubkey     a one-time key, made for this event and wiped after signing
 //! created_at 1059: now − U(0, 300 s), 21059: now (strfry drops ephemeral
 //!            events older than 60 s)
-//! tags       [["p", <mailbox>], ["expiration", <created_at + U(6 d, 8 d)>]]
-//!            the expiration only on 1059; no other tag
+//! tags       [["p", <mailbox>], ["expiration", <1059: created_at + U(6 d, 8 d),
+//!                                               21059: created_at + U(1 h, 2 h)>]]
+//!            no other tag (`diseno-vinculacion.md` §23.8)
 //! content    NIP-44 v2 of the inner frame, from the one-time key to the mailbox
 //! sig        BIP-340 by the one-time key, with auxiliary randomness
 //! ```
@@ -40,6 +41,12 @@ pub const MAX_BACKDATE_SECS: i64 = 300;
 /// A message expires 6 to 8 days after its `created_at`.
 pub const MIN_EXPIRATION_SECS: i64 = 6 * 86_400;
 pub const MAX_EXPIRATION_SECS: i64 = 8 * 86_400;
+/// A call signal expires 1 to 2 hours after its `created_at`
+/// (`diseno-vinculacion.md` §23.8): public relays drop it sooner anyway, but
+/// the tag makes it look like every other P1 event and meets the minimum of
+/// Trino's own relay gate.
+pub const MIN_CALL_EXPIRATION_SECS: i64 = 3_600;
+pub const MAX_CALL_EXPIRATION_SECS: i64 = 7_200;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum EventError {
@@ -101,9 +108,13 @@ pub fn seal_event_with_rng<R: RngCore + CryptoRng>(
         KIND_MESSAGE => {
             let created_at = now - rng.gen_range(0..=MAX_BACKDATE_SECS);
             let expiration = created_at + rng.gen_range(MIN_EXPIRATION_SECS..=MAX_EXPIRATION_SECS);
-            (created_at, Some(expiration))
+            (created_at, expiration)
         }
-        KIND_CALL => (now, None),
+        KIND_CALL => {
+            let expiration =
+                now + rng.gen_range(MIN_CALL_EXPIRATION_SECS..=MAX_CALL_EXPIRATION_SECS);
+            (now, expiration)
+        }
         other => return Err(EventError::Kind(other)),
     };
     let mut one_time = loop {
@@ -138,7 +149,7 @@ pub fn seal_event_with_rng<R: RngCore + CryptoRng>(
 fn seal_parts(
     kind: u32,
     created_at: i64,
-    expiration: Option<i64>,
+    expiration: i64,
     one_time: &SecretKey,
     mailbox: &[u8; 32],
     inner: &[u8],
@@ -154,10 +165,10 @@ fn seal_parts(
     let one_time_bytes = Zeroizing::new(one_time.secret_bytes());
     let conversation = nip44::conversation_key(&one_time_bytes, mailbox)?;
     let content = nip44::encrypt_with_nonce(&conversation, inner, nip44_nonce)?;
-    let mut tags = vec![vec!["p".to_string(), hex::encode(mailbox)]];
-    if let Some(expiration) = expiration {
-        tags.push(vec!["expiration".to_string(), expiration.to_string()]);
-    }
+    let tags = vec![
+        vec!["p".to_string(), hex::encode(mailbox)],
+        vec!["expiration".to_string(), expiration.to_string()],
+    ];
     let id = event_id(&pubkey, created_at, kind, &tags, &content);
     let sig = SECP256K1.sign_schnorr_with_aux_rand(&Message::from_digest(id), &keypair, aux);
     keypair.non_secure_erase();
@@ -210,15 +221,13 @@ fn decode_hex<const N: usize>(s: &str) -> Option<[u8; N]> {
     hex::decode(s).ok()?.try_into().ok()
 }
 
-/// The mailbox of an event with the shape of P1, or `None`: kind 1059 with
-/// exactly one `p` and one `expiration` and nothing else, or kind 21059 with
-/// exactly one `p`. The mailbox is 64 lower-case hex digits.
+/// The mailbox of an event with the shape of P1, or `None`: kind 1059 or
+/// 21059 with exactly one `p` and one `expiration` and nothing else
+/// (`diseno-vinculacion.md` §23.8). The mailbox is 64 lower-case hex digits.
 pub fn mailbox_of(event: &Event) -> Option<[u8; 32]> {
-    let want_expiration = match event.kind {
-        KIND_MESSAGE => true,
-        KIND_CALL => false,
-        _ => return None,
-    };
+    if event.kind != KIND_MESSAGE && event.kind != KIND_CALL {
+        return None;
+    }
     let mut mailbox = None;
     let mut expiration = false;
     for tag in &event.tags {
@@ -226,7 +235,7 @@ pub fn mailbox_of(event: &Event) -> Option<[u8; 32]> {
             [name, value] if name == "p" && mailbox.is_none() => {
                 mailbox = Some(decode_hex::<32>(value)?);
             }
-            [name, value] if name == "expiration" && want_expiration && !expiration => {
+            [name, value] if name == "expiration" && !expiration => {
                 if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
                     return None;
                 }
@@ -235,7 +244,7 @@ pub fn mailbox_of(event: &Event) -> Option<[u8; 32]> {
             _ => return None,
         }
     }
-    (expiration == want_expiration).then_some(mailbox?)
+    expiration.then_some(mailbox?)
 }
 
 /// The inner frame of an event, opened with the secret key of its mailbox.
@@ -291,11 +300,7 @@ mod tests {
         for c in cases() {
             let want = event_of(&c);
             let one_time = SecretKey::from_slice(&h32(&c["one_time_sk"])).unwrap();
-            let expiration = want
-                .tags
-                .iter()
-                .find(|t| t[0] == "expiration")
-                .map(|t| t[1].parse().unwrap());
+            let expiration = want.tags[1][1].parse().unwrap();
             let got = seal_parts(
                 want.kind,
                 want.created_at,
@@ -388,10 +393,25 @@ mod tests {
             assert_eq!(mailbox_of(&e), Some(mailbox));
             assert!(verify_event(&e));
         }
-        let call = seal_event_with_rng(KIND_CALL, now, &mailbox, b"x", &mut rng).unwrap();
-        assert_eq!(call.created_at, now);
-        assert_eq!(call.tags, vec![vec!["p".to_string(), hex::encode(mailbox)]]);
-        assert_eq!(mailbox_of(&call), Some(mailbox));
+        let mut call_expirations = std::collections::HashSet::new();
+        for _ in 0..200 {
+            let call = seal_event_with_rng(KIND_CALL, now, &mailbox, b"x", &mut rng).unwrap();
+            assert_eq!(call.created_at, now);
+            assert_eq!(call.tags.len(), 2);
+            assert_eq!(call.tags[0], vec!["p".to_string(), hex::encode(mailbox)]);
+            assert_eq!(call.tags[1][0], "expiration");
+            let exp: i64 = call.tags[1][1].parse().unwrap();
+            assert!(
+                (now + MIN_CALL_EXPIRATION_SECS..=now + MAX_CALL_EXPIRATION_SECS).contains(&exp)
+            );
+            call_expirations.insert(exp);
+            assert_eq!(mailbox_of(&call), Some(mailbox));
+            assert!(verify_event(&call));
+        }
+        assert!(
+            call_expirations.len() > 150,
+            "the call's expiration is not a fixed offset"
+        );
     }
 
     #[test]
@@ -449,8 +469,11 @@ mod tests {
             vec![p.clone(), vec!["expiration".into(), "soon".into()]]
         ))
         .is_none());
-        assert!(mailbox_of(&with(KIND_CALL, vec![p.clone()])).is_some());
-        assert!(mailbox_of(&with(KIND_CALL, vec![p.clone(), exp.clone()])).is_none());
+        // diseno-vinculacion.md §23.8: a call signal carries an expiration too.
+        assert!(mailbox_of(&with(KIND_CALL, vec![p.clone(), exp.clone()])).is_some());
+        assert!(mailbox_of(&with(KIND_CALL, vec![exp.clone(), p.clone()])).is_some());
+        assert!(mailbox_of(&with(KIND_CALL, vec![p.clone()])).is_none());
+        assert!(mailbox_of(&with(KIND_CALL, vec![p.clone(), exp.clone(), exp.clone()])).is_none());
         assert!(mailbox_of(&with(4848, vec![p.clone(), exp.clone()])).is_none());
         let upper = vec!["p".to_string(), p[1].to_uppercase()];
         assert!(mailbox_of(&with(KIND_MESSAGE, vec![upper, exp.clone()])).is_none());

@@ -4,7 +4,8 @@ diseno.md §2.1:
 
     {"kind": 1059 (21059 for calls), "pubkey": <one-time key>,
      "created_at": <1059: now - U(0, 300 s); 21059: now>,
-     "tags": [["p", <mailbox>], ["expiration", <created_at + U(6 d, 8 d)>]],  # expiration only on 1059
+     "tags": [["p", <mailbox>], ["expiration", <1059: created_at + U(6 d, 8 d);
+                                                 21059: created_at + U(1 h, 2 h)>]],
      "content": <NIP-44 v2 from the one-time key to the mailbox>,
      "sig": <BIP-340 by the one-time key, with auxiliary randomness>}
 
@@ -110,7 +111,9 @@ def main():
         [
             (1059, 1024, 1_793_000_000, 1_793_000_000 + 6 * 86400),
             (1059, 16384, 1_793_086_399, 1_793_086_399 + 8 * 86400),
-            (21059, 4096, 1_793_100_000, None),
+            # diseno-vinculacion.md §23.8: a call signal expires too, 1 to 2 hours out.
+            (21059, 4096, 1_793_100_000, 1_793_100_000 + 3600),
+            (21059, 16384, 1_793_100_123, 1_793_100_123 + 7200),
         ]
     ):
         one_time = scalar(f"trino/p1-event/one-time/{i}")
@@ -122,9 +125,7 @@ def main():
         pubkey = xonly(one_time).hex()
         content = nip44_encrypt(conversation_key(one_time, mailbox), nonce, inner)
         assert content == nip44_encrypt(conversation_key(mailbox_sk, bytes.fromhex(pubkey)), nonce, inner)
-        tags = [["p", mailbox.hex()]]
-        if expiration is not None:
-            tags.append(["expiration", str(expiration)])
+        tags = [["p", mailbox.hex()], ["expiration", str(expiration)]]
         serial = json.dumps([0, pubkey, created_at, kind, tags, content], separators=(",", ":"), ensure_ascii=False)
         event_id = hashlib.sha256(serial.encode()).digest()
         sig = bip340_sign(event_id, one_time, aux)
