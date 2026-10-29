@@ -9,6 +9,7 @@
 | `mlkem768.json` | ML-KEM-768: public keys from seeds, ciphertexts and shared secrets, and the implicit rejection of a flipped ciphertext | Made by OpenSSL 4.0.2 through `mlkem768.py` (Python's `cryptography` 50.0.1). Encapsulation is randomized there, so a rerun prints other ciphertexts; the tests read the committed file. |
 | `pq_spk.json` | Signed post-quantum prekeys: the ML-KEM-768 key from a seed and its deterministic Ed25519 signature | OpenSSL through `pq_spk.py`. Rerunning the script prints the same file. |
 | `pqxdh.json` | The hybrid handshake: the three X25519 results, an ML-KEM-768 ciphertext and secret, SK, AD and the `dev_sign` signature of the SPK | OpenSSL through `pqxdh.py` (X25519, ML-KEM-768, HKDF, Ed25519). Encapsulation is randomized there, so a rerun prints other ciphertexts and keys; the tests read the committed file. |
+| `acvp_mldsa_keygen.json` | ML-DSA keyGen (FIPS 204) for ML-DSA-44, 65 and 87, 25 cases each, with seed, public key and expanded private key; the tests use the ML-DSA-65 group | NIST's ACVP server, downloaded unchanged (see "Downloads"). |
 
 ## Downloads
 
@@ -17,6 +18,7 @@ Downloaded unchanged on 29 Oct 2026. Nothing in them is executed; the tests only
 | File | URL | Source commit | SHA-256 |
 | --- | --- | --- | --- |
 | `nip44.vectors.json` | https://raw.githubusercontent.com/paulmillr/nip44/671a1f04bcfacaf125b0db68adc45bc9ce0e763b/nip44.vectors.json | `paulmillr/nip44` @ `671a1f04bcfacaf125b0db68adc45bc9ce0e763b` | `269ed0f69e4c192512cc779e78c555090cebc7c785b609e338a62afc3ce25040`, the same checksum NIP-44 publishes |
+| `acvp_mldsa_keygen.json` | https://raw.githubusercontent.com/usnistgov/ACVP-Server/975de31eb83d87039ec88934fdc47d8c312b892d/gen-val/json-files/ML-DSA-keyGen-FIPS204/internalProjection.json | `usnistgov/ACVP-Server` @ `975de31eb83d87039ec88934fdc47d8c312b892d` (`internalProjection.json`, git blob `ebf2104da140b725675aea4cc47676c0536421f7`) | `e67ee6540d40e11506c3c4e3b1f79fc1cefcd49820db99fc61f87cc8ba463baf` |
 
 ## History
 

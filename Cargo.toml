@@ -43,6 +43,12 @@ argon2 = { version = "0.5.3", default-features = false, features = ["alloc", "ze
 # ML-KEM-768 for the hybrid handshake (P1-18, PQ-03). Pinned to an exact
 # version: the API is pre-1.0 and the lock file is not versioned. Apache-2.0.
 libcrux-ml-kem = { version = "=0.0.11", default-features = false, features = ["mlkem768"] }
+# ML-DSA-65 key generation for the reserve key's post-quantum half
+# (diseno-vinculacion.md §21.9, DN-05): only keygen, nothing is signed yet.
+# RustCrypto's crate passed S-PQ1 and S-PQ3 and is checked against NIST's
+# ACVP keyGen vectors. Exact version: pre-1.0 API, unversioned lock file.
+# MIT OR Apache-2.0.
+ml-dsa = { version = "=0.1.1", default-features = false, features = ["alloc", "zeroize"] }
 # The DRBG that feeds ML-KEM and the injectable randomness (P1-18). The 0.3
 # line matches rand 0.8 and rand_core 0.6. MIT OR Apache-2.0.
 rand_chacha = "0.3"
