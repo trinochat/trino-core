@@ -113,6 +113,17 @@ def main():
     t4 = det("trino/p1-wire/t4/ct", 1088) + type1("trino/p1-wire/t4/msg", 300)
     out["frames"].append(entry("type4-4096", 4, 4096, ts, t4, k_mac, inner(1, 4, ts, t4, 4096, k_mac)))
 
+    # Type 5, a PQ-11 handshake: suite 1, pq_ek 1184, dev_dh, ek, spk_id, opk_id, then a type 1 body.
+    t5 = (
+        b"\x01"
+        + det("trino/p1-wire/t5/pq_ek", 1184)
+        + det("trino/p1-wire/t5/dev_dh", 32)
+        + det("trino/p1-wire/t5/ek", 32)
+        + struct.pack(">II", 43, 0xFFFFFFFF)
+        + type1("trino/p1-wire/t5/msg", 400)
+    )
+    out["frames"].append(entry("type5-4096", 5, 4096, ts, t5, k_mac, inner(1, 5, ts, t5, 4096, k_mac)))
+
     # Type 3: pow_nonce, suite, con_kem, e, dev_dh, [ct_R], sealed part.
     r = det("trino/p1-wire/t3/R", 32)
     for con_kem, sealed_len in [(0, 1500), (1, 2500)]:

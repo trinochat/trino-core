@@ -14,6 +14,8 @@
 //! type 3, request:    pow_nonce u64 ‖ suite u8 ‖ con_kem u8 ‖ e 32 ‖ dev_dh 32
 //!                     ‖ [ct_R 1088 if con_kem] ‖ sealed part                         (16 KiB)
 //! type 4, KEM reply:  ct 1088 ‖ <type 1 body>                                        (4 KiB)
+//! type 5, PQ-11 hs:   suite u8 ‖ pq_ek 1184 ‖ dev_dh 32 ‖ ek 32 ‖ spk_id u32
+//!                     ‖ opk_id u32 ‖ <type 1 body, no user text>                       (4 KiB)
 //! pow   = SHA-256("trino/p1/v2/pow" ‖ R ‖ SHA-256(type 3 body after pow_nonce) ‖ pow_nonce)
 //! ```
 //!
@@ -68,6 +70,8 @@ const GCM_TAG_LEN: usize = 16;
 const MESSAGE_FIXED: usize = 32 + 4 + 4 + 12;
 /// suite 1, pq_spk_id 4, ct 1088, dev_dh 32, ek 32, spk_id 4, opk_id 4.
 pub const HANDSHAKE_FIXED: usize = 1 + 4 + KEM_CT_LEN + 32 + 32 + 4 + 4;
+/// suite 1, pq_ek 1184, dev_dh 32, ek 32, spk_id 4, opk_id 4.
+pub const HANDSHAKE_PQ11_FIXED: usize = 1 + crate::kem::EK_LEN + 32 + 32 + 4 + 4;
 /// pow_nonce 8, suite 1, con_kem 1, e 32, dev_dh 32.
 const REQUEST_FIXED: usize = 8 + 1 + 1 + 32 + 32;
 
@@ -117,6 +121,10 @@ pub enum InnerType {
     Request = 3,
     /// The first reply of a PQ-11 session: the KEM ciphertext (§21.6).
     KemReply = 4,
+    /// A PQ-11 handshake: the initiator brings an ephemeral ML-KEM key
+    /// because it has no `pq_spk` of the other device (§21.6). §21.6 gives
+    /// it no way to tell it from a type 2; a type of its own costs no byte.
+    HandshakePq11 = 5,
 }
 
 /// An opened inner frame.
@@ -164,6 +172,7 @@ impl InnerType {
             2 => Ok(InnerType::Handshake),
             3 => Ok(InnerType::Request),
             4 => Ok(InnerType::KemReply),
+            5 => Ok(InnerType::HandshakePq11),
             other => Err(WireError::UnknownType(other)),
         }
     }
@@ -172,7 +181,9 @@ impl InnerType {
     pub fn allows(self, step: Step) -> bool {
         match self {
             InnerType::Message => true,
-            InnerType::Handshake | InnerType::KemReply => step == Step::K4,
+            InnerType::Handshake | InnerType::KemReply | InnerType::HandshakePq11 => {
+                step == Step::K4
+            }
             InnerType::Request => step == Step::K16,
         }
     }
@@ -348,6 +359,19 @@ pub struct HandshakeBody {
     pub message: MessageBody,
 }
 
+/// A type 5 body: a PQ-11 handshake with the initiator's ephemeral ML-KEM
+/// key and a first message that carries no user text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HandshakePq11Body {
+    pub suite: u8,
+    pub pq_ek: Box<[u8; crate::kem::EK_LEN]>,
+    pub dev_dh: [u8; 32],
+    pub ek: [u8; 32],
+    pub spk_id: u32,
+    pub opk_id: Option<u32>,
+    pub message: MessageBody,
+}
+
 /// A type 4 body: the KEM ciphertext of a PQ-11 session and the first reply.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KemReplyBody {
@@ -499,6 +523,41 @@ impl HandshakeBody {
             suite,
             pq_spk_id,
             ct,
+            dev_dh,
+            ek,
+            spk_id,
+            opk_id,
+            message: MessageBody::decode(r.rest())?,
+        })
+    }
+}
+
+impl HandshakePq11Body {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(
+            HANDSHAKE_PQ11_FIXED + MESSAGE_FIXED + self.message.ciphertext.len(),
+        );
+        out.push(self.suite);
+        out.extend_from_slice(&self.pq_ek[..]);
+        out.extend_from_slice(&self.dev_dh);
+        out.extend_from_slice(&self.ek);
+        out.extend_from_slice(&self.spk_id.to_be_bytes());
+        out.extend_from_slice(&self.opk_id.unwrap_or(NO_OPK).to_be_bytes());
+        out.extend_from_slice(&self.message.encode());
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Self, WireError> {
+        let mut r = Reader(b);
+        let suite = check_suite(r.u8()?)?;
+        let pq_ek = Box::new(r.arr()?);
+        let dev_dh = r.arr()?;
+        let ek = r.arr()?;
+        let spk_id = r.u32()?;
+        let opk_id = Some(r.u32()?).filter(|&id| id != NO_OPK);
+        Ok(HandshakePq11Body {
+            suite,
+            pq_ek,
             dev_dh,
             ek,
             spk_id,
@@ -699,6 +758,11 @@ mod tests {
                 InnerType::KemReply => {
                     assert_eq!(KemReplyBody::decode(&body).unwrap().encode(), body)
                 }
+                InnerType::HandshakePq11 => {
+                    let h = HandshakePq11Body::decode(&body).unwrap();
+                    assert_eq!((h.spk_id, h.opk_id), (43, None));
+                    assert_eq!(h.encode(), body);
+                }
                 InnerType::Request => {
                     assert_eq!(RequestBody::decode(&body).unwrap().encode(), body)
                 }
@@ -778,6 +842,42 @@ mod tests {
             message: sample_message(40),
         };
         assert_eq!(KemReplyBody::decode(&k.encode()).unwrap(), k);
+    }
+
+    #[test]
+    fn a_pq11_handshake_round_trips_and_has_its_fixed_size() {
+        assert_eq!(
+            HANDSHAKE_PQ11_FIXED, 1257,
+            "§21.4: the fixed part of a PQ-11 type 2 is 1.257 bytes"
+        );
+        let h = HandshakePq11Body {
+            suite: SUITE_X25519_MLKEM768,
+            pq_ek: Box::new([5; crate::kem::EK_LEN]),
+            dev_dh: [6; 32],
+            ek: [7; 32],
+            spk_id: 8,
+            opk_id: None,
+            message: sample_message(70),
+        };
+        let enc = h.encode();
+        assert_eq!(enc.len(), HANDSHAKE_PQ11_FIXED + MESSAGE_FIXED + 70);
+        assert_eq!(HandshakePq11Body::decode(&enc).unwrap(), h);
+        let mut bad = enc.clone();
+        bad[0] = 0;
+        assert_eq!(
+            HandshakePq11Body::decode(&bad).unwrap_err(),
+            WireError::Suite(0)
+        );
+        assert_eq!(
+            HandshakePq11Body::decode(&enc[..1300]).unwrap_err(),
+            WireError::Malformed
+        );
+        let k = [1u8; 32];
+        assert!(seal_inner(InnerType::HandshakePq11, 1, &enc, Step::K4, &k).is_ok());
+        assert_eq!(
+            seal_inner(InnerType::HandshakePq11, 1, &enc, Step::K16, &k).unwrap_err(),
+            WireError::WrongStep(5)
+        );
     }
 
     #[test]
