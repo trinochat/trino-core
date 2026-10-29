@@ -7,5 +7,7 @@
 //! pure parts; the app owns the relays, the clock and the storage.
 //!
 //! - [`mailbox`]: the mailbox derivations (design P1 §3).
+//! - [`wire`]: the inner frame, its steps, MAC and proof of work (§2.2-§2.3).
 
 pub mod mailbox;
+pub mod wire;
