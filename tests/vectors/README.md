@@ -10,6 +10,7 @@
 | `pq_spk.json` | Signed post-quantum prekeys: the ML-KEM-768 key from a seed and its deterministic Ed25519 signature | OpenSSL through `pq_spk.py`. Rerunning the script prints the same file. |
 | `pqxdh.json` | The hybrid handshake: the three X25519 results, an ML-KEM-768 ciphertext and secret, SK, AD and the `dev_sign` signature of the SPK | OpenSSL through `pqxdh.py` (X25519, ML-KEM-768, HKDF, Ed25519). Encapsulation is randomized there, so a rerun prints other ciphertexts and keys; the tests read the committed file. |
 | `kit.json` | The 12-word kit: entropy, check bits, indices and words in the three lists (also as typed, composed); Argon2id `K`, `k_reserva` and `h_check`; two kits whose words pass in Spanish and in English | Computed by `kit.py` with Python's standard library and OpenSSL (Argon2id, HKDF). Rerunning the script prints the same file. |
+| `reserve.json` | The hybrid reserve key: Ed25519 and ML-DSA-65 public keys from their seeds, `rot_pqh`, `next`, the 92-byte blob and the 157-byte vault record; case 0 is sealed with the `k_reserva` of the all-zero kit in `kit.json` | OpenSSL (Ed25519, ML-DSA-65, AES-256-GCM) through `reserve.py`. Rerunning the script prints the same file. |
 | `acvp_mldsa_keygen.json` | ML-DSA keyGen (FIPS 204) for ML-DSA-44, 65 and 87, 25 cases each, with seed, public key and expanded private key; the tests use the ML-DSA-65 group | NIST's ACVP server, downloaded unchanged (see "Downloads"). |
 
 ## Downloads

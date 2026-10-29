@@ -26,7 +26,10 @@
 //! by columns, [`KitError::ByColumns`] lets the screen ask "Did you write
 //! them down by columns?", and [`Kit::parse_by_columns`] reads them so.
 
+mod record;
 mod words;
+
+pub use record::{KitRecord, RecordError, RECORD_LEN};
 
 use crate::kdf::{KdfError, KdfParams};
 use hkdf::Hkdf;

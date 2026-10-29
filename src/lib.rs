@@ -35,6 +35,7 @@ pub mod p1;
 pub mod pq_spk;
 pub mod pqxdh;
 pub mod ratchet;
+pub mod reserve;
 pub mod totp;
 pub mod vault;
 pub mod vault_v3;
