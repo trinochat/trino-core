@@ -7,7 +7,9 @@
 //! pure parts; the app owns the relays, the clock and the storage.
 //!
 //! - [`mailbox`]: the mailbox derivations (design P1 §3).
+//! - [`frame`]: the binary frame inside the ratchet (§21.4).
 //! - [`wire`]: the inner frame, its steps, MAC and proof of work (§2.2-§2.3).
 
+pub mod frame;
 pub mod mailbox;
 pub mod wire;

@@ -33,7 +33,7 @@
 //! - **Type 3 has no MAC key** (a stranger cannot know one); its proof of
 //!   work is checked after NIP-44 and before any Diffie-Hellman.
 //!
-//! The ratchet's plaintext is the binary frame of `p1/frame.rs` (§21.4).
+//! The ratchet's plaintext is the binary frame of [`crate::p1::frame`].
 //!
 //! The tests check frames and a 24-bit proof of work built independently in
 //! Python (`tests/vectors/p1_wire.py`).
