@@ -1,5 +1,6 @@
 use crate::crypto::{aes_gcm_decrypt, aes_gcm_encrypt, concat, hkdf_expand, CryptoError};
 use crate::identity::{generate_x25519, x25519_derive_shared, KeyPair};
+use crate::p1::mailbox::{MailboxError, SessionChain};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
@@ -21,6 +22,11 @@ const MAX_RETIRED_DH_KEYS: usize = 8;
 // undecryptable, which is the correct trade against unbounded growth.
 const MAX_SKIPPED_KEYS: usize = 2000;
 
+/// The state version of a P1 session (hybrid handshake and mailboxes).
+/// Version 0 is a session from before P1: the app drops it on load and
+/// sends a delayed handshake (design P1 §9, R-01).
+pub const STATE_VERSION: u32 = 2;
+
 #[derive(Debug, Error)]
 pub enum RatchetError {
     #[error("no sending chain (waiting for peer message)")]
@@ -35,6 +41,12 @@ pub enum RatchetError {
     Replay { n: u32 },
     #[error("crypto error: {0}")]
     Crypto(#[from] CryptoError),
+    #[error("ratchet state version {0} is newer than this code")]
+    StateVersion(u32),
+    #[error("ratchet state does not decode")]
+    Decode,
+    #[error("mailbox chain: {0}")]
+    Mailbox(#[from] MailboxError),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -57,6 +69,19 @@ pub struct RatchetState {
     // replay instead of a new ratchet step.
     #[serde(default)]
     pub retired_peer_dh_keys: Vec<[u8; 32]>,
+    // P1 (design P1 §9, diseno-vinculacion.md §21.5). All defaulted, so a
+    // session from before P1 loads as version 0 with no mailbox chain.
+    #[serde(default)]
+    pub version: u32,
+    /// The handshake suite; 0 before P1.
+    #[serde(default)]
+    pub suite: u8,
+    /// Today's and yesterday's session mailbox secrets.
+    #[serde(default)]
+    pub session: Option<SessionChain>,
+    /// A PQ-11 session still waiting for the type 4 ciphertext (§21.6).
+    #[serde(default)]
+    pub awaiting_kem: bool,
 }
 
 impl RatchetState {
@@ -76,6 +101,40 @@ impl RatchetState {
         self.receiving_chain_key = None;
         self.skipped_keys.clear();
         self.skipped_key_order.clear();
+        // SessionChain wipes itself on drop.
+        self.session = None;
+    }
+
+    /// Makes this a P1 session: records the suite and starts the mailbox
+    /// chain from `S_ses` at `e0`, the epoch of the authenticated `ts` of
+    /// the message that carried the handshake, walked to `today` (§3.3).
+    pub fn attach_session(
+        &mut self,
+        suite: u8,
+        s_ses: &[u8; 32],
+        e0: u32,
+        today: u32,
+    ) -> Result<(), RatchetError> {
+        self.session = Some(SessionChain::start(s_ses, e0, today)?);
+        self.suite = suite;
+        self.version = STATE_VERSION;
+        Ok(())
+    }
+
+    /// Whether this session can run on P1. One that cannot is dropped on
+    /// load; the contact stays and gets a delayed handshake.
+    pub fn is_p1(&self) -> bool {
+        self.version == STATE_VERSION && self.suite == crate::pqxdh::SUITE && self.session.is_some()
+    }
+
+    /// Decodes a stored state and refuses a version newer than this code.
+    pub fn load(bytes: &[u8]) -> Result<RatchetState, RatchetError> {
+        let state: RatchetState =
+            serde_json::from_slice(bytes).map_err(|_| RatchetError::Decode)?;
+        if state.version > STATE_VERSION {
+            return Err(RatchetError::StateVersion(state.version));
+        }
+        Ok(state)
     }
 }
 
@@ -120,6 +179,10 @@ pub fn init_initiator(
         skipped_keys: HashMap::new(),
         skipped_key_order: Vec::new(),
         retired_peer_dh_keys: Vec::new(),
+        version: 0,
+        suite: 0,
+        session: None,
+        awaiting_kem: false,
     })
 }
 
@@ -136,6 +199,10 @@ pub fn init_responder(master_secret: [u8; 32], our_spk_keypair: KeyPair) -> Ratc
         skipped_keys: HashMap::new(),
         skipped_key_order: Vec::new(),
         retired_peer_dh_keys: Vec::new(),
+        version: 0,
+        suite: 0,
+        session: None,
+        awaiting_kem: false,
     }
 }
 
@@ -784,5 +851,68 @@ mod tests {
             ratchet_decrypt(&mut bob, &ct, &ad),
             Err(RatchetError::TooManySkipped(_))
         ));
+    }
+
+    // ------------------------------------------------------------ P1 state
+
+    fn p1_pair() -> (RatchetState, RatchetState) {
+        let bob_spk = generate_x25519();
+        let a = init_initiator([1; 32], bob_spk.pub_bytes).unwrap();
+        let b = init_responder([1; 32], bob_spk);
+        (a, b)
+    }
+
+    #[test]
+    fn a_state_from_before_p1_loads_as_version_0_without_a_session() {
+        let (a, _) = p1_pair();
+        let mut raw = serde_json::to_value(&a).unwrap();
+        for k in ["version", "suite", "session", "awaiting_kem"] {
+            raw.as_object_mut().unwrap().remove(k);
+        }
+        let loaded = RatchetState::load(&serde_json::to_vec(&raw).unwrap()).unwrap();
+        assert_eq!((loaded.version, loaded.suite), (0, 0));
+        assert!(loaded.session.is_none());
+        assert!(!loaded.is_p1());
+    }
+
+    #[test]
+    fn a_newer_state_version_is_refused() {
+        let (mut a, _) = p1_pair();
+        a.attach_session(1, &[2; 32], 10, 10).unwrap();
+        a.version = STATE_VERSION + 1;
+        let bytes = serde_json::to_vec(&a).unwrap();
+        assert!(matches!(
+            RatchetState::load(&bytes),
+            Err(RatchetError::StateVersion(v)) if v == STATE_VERSION + 1
+        ));
+        assert!(matches!(
+            RatchetState::load(b"{"),
+            Err(RatchetError::Decode)
+        ));
+    }
+
+    #[test]
+    fn a_p1_session_round_trips_and_keeps_only_two_days() {
+        let (mut a, _) = p1_pair();
+        a.attach_session(1, &[2; 32], 10, 12).unwrap();
+        assert!(a.is_p1());
+        let loaded = RatchetState::load(&serde_json::to_vec(&a).unwrap()).unwrap();
+        assert!(loaded.is_p1());
+        let chain = loaded.session.as_ref().unwrap();
+        assert_eq!(chain.epoch, 12);
+        assert!(chain.secret(12).is_some() && chain.secret(11).is_some());
+        assert!(chain.secret(10).is_none());
+        // Another suite is not a P1 session.
+        let (mut b, _) = p1_pair();
+        b.attach_session(0, &[2; 32], 10, 10).unwrap();
+        assert!(!b.is_p1());
+    }
+
+    #[test]
+    fn wiping_the_state_drops_the_mailbox_chain() {
+        let (mut a, _) = p1_pair();
+        a.attach_session(1, &[2; 32], 10, 10).unwrap();
+        a.zeroize_secrets();
+        assert!(a.session.is_none());
     }
 }

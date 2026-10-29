@@ -31,9 +31,10 @@
 
 use crate::crypto::hkdf_expand;
 use secp256k1::{SecretKey, SECP256K1};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use x25519_dalek::{PublicKey as XPublicKey, StaticSecret};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 /// Length of an epoch: 24 hours.
 pub const EPOCH_SECS: u64 = 86_400;
@@ -72,6 +73,62 @@ pub struct Mailbox {
     pub tag: [u8; 32],
     /// The key of the inner frame's MAC (design P1 §2.2).
     pub k_mac: Zeroizing<[u8; 32]>,
+}
+
+/// A session's mailbox chain as it is kept: today's `s_e` and yesterday's,
+/// never older ones and never `S_ses` (§3.3, O4).
+#[derive(Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop, PartialEq, Eq)]
+pub struct SessionChain {
+    /// The epoch of `current`.
+    pub epoch: u32,
+    current: [u8; 32],
+    previous: Option<[u8; 32]>,
+}
+
+impl std::fmt::Debug for SessionChain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SessionChain {{ epoch: {} }}", self.epoch)
+    }
+}
+
+impl SessionChain {
+    /// Starts from `S_ses`: `s_e0`, walked forward to `today` when the
+    /// handshake is processed late. A `today` before `e0` (a sender whose
+    /// clock is ahead) starts at `e0`.
+    pub fn start(s_ses: &[u8; 32], e0: u32, today: u32) -> Result<Self, MailboxError> {
+        let mut chain = SessionChain {
+            epoch: e0,
+            current: *epoch_secret(s_ses, e0),
+            previous: None,
+        };
+        chain.advance_to(today.max(e0))?;
+        Ok(chain)
+    }
+
+    /// Moves to epoch `e`, keeping the one before it. Never goes back.
+    pub fn advance_to(&mut self, e: u32) -> Result<(), MailboxError> {
+        if e == self.epoch {
+            return Ok(());
+        }
+        // Checks the direction and the distance before touching anything.
+        let yesterday = advance(&self.current, self.epoch, e - 1)?;
+        let today = next_epoch(&yesterday);
+        self.previous = Some(*yesterday);
+        self.current = *today;
+        self.epoch = e;
+        Ok(())
+    }
+
+    /// `s_e` for today's epoch or the one before; `None` for any other.
+    pub fn secret(&self, e: u32) -> Option<&[u8; 32]> {
+        if e == self.epoch {
+            Some(&self.current)
+        } else if Some(e) == self.epoch.checked_sub(1) {
+            self.previous.as_ref()
+        } else {
+            None
+        }
+    }
 }
 
 /// The epoch of a network time `ts` (seconds since the Unix epoch).
@@ -332,6 +389,35 @@ mod tests {
             MailboxError::BadAdvance
         );
         assert!(advance(&[1u8; 32], 0, MAX_ADVANCE).is_ok());
+    }
+
+    #[test]
+    fn a_session_chain_keeps_today_and_yesterday_only() {
+        for c in v()["session"].as_array().unwrap() {
+            let seed = h32(&c["session_seed"]);
+            let chain: Vec<[u8; 32]> = c["chain"].as_array().unwrap().iter().map(h32).collect();
+            let e0 = c["e0"].as_u64().unwrap() as u32;
+            let mut s = SessionChain::start(&seed, e0, e0).unwrap();
+            assert_eq!((s.epoch, s.secret(e0)), (e0, Some(&chain[0])));
+            assert_eq!(s.secret(e0 - 1), None);
+            s.advance_to(e0 + 1).unwrap();
+            assert_eq!(s.secret(e0 + 1), Some(&chain[1]));
+            assert_eq!(s.secret(e0), Some(&chain[0]));
+            // Two days at once: yesterday is e0 + 2, not e0 + 1.
+            s.advance_to(e0 + 3).unwrap();
+            assert_eq!(s.secret(e0 + 3), Some(&chain[3]));
+            assert_eq!(s.secret(e0 + 2), Some(&chain[2]));
+            assert_eq!(s.secret(e0 + 1), None);
+            assert_eq!(s.advance_to(e0 + 2).unwrap_err(), MailboxError::BadAdvance);
+            s.advance_to(e0 + 3).unwrap();
+            assert_eq!(s.epoch, e0 + 3);
+            // Processed three days late: the same place.
+            let late = SessionChain::start(&seed, e0, e0 + 3).unwrap();
+            assert_eq!(late, s);
+            // A sender whose clock is ahead: start at e0.
+            let early = SessionChain::start(&seed, e0, e0 - 1).unwrap();
+            assert_eq!(early.epoch, e0);
+        }
     }
 
     #[test]

@@ -48,8 +48,12 @@
 //! initiator cannot compute the session one before opening it.
 //!
 //! Not here yet: that `dev_dh_ini` belongs to `A_ini`'s device list (§5.1,
-//! RV-06) is checked by the device list code (VI-1), and `S_ses` comes from
-//! `SK` in P1-5.
+//! RV-06) is checked by the device list code (VI-1).
+//!
+//! **`S_ses`** (design P1 §3.3) comes out with the secret on both sides:
+//! from `SK` and `AD` in the normal mode, from `root'` and `AD` in PQ-11,
+//! never from `SK₀`. The caller hands it to `RatchetState::attach_session`
+//! and lets it drop, which wipes it.
 //!
 //! The tests check SK, AD and the SPK signature against OpenSSL
 //! (`tests/vectors/pqxdh.py`), with OpenSSL's ciphertexts opened by libcrux.
@@ -57,6 +61,7 @@
 use crate::crypto::{hkdf_expand, sha256};
 use crate::identity::{ed25519_sign, KeyPair};
 use crate::kem::{encapsulate_with_rng, KemError, KemSecret, CT_LEN, EK_LEN};
+use crate::p1::mailbox::session_seed;
 use crate::p1::wire::{HandshakeBody, HandshakePq11Body, MessageBody, SUITE_X25519_MLKEM768};
 use crate::pq_spk::{PqSpkError, SignedPqPrekey};
 use ed25519_dalek::{Signature, VerifyingKey};
@@ -115,6 +120,8 @@ pub struct PeerPrekeys {
 /// The initiator's result: the secret, the AD, and the handshake fields.
 pub struct Initiation {
     pub sk: Zeroizing<[u8; 32]>,
+    /// `S_ses` (design P1 §3.3) from this SK and AD.
+    pub s_ses: Zeroizing<[u8; 32]>,
     pub ad: Vec<u8>,
     pub pq_spk_id: u32,
     pub ct: Box<[u8; CT_LEN]>,
@@ -135,6 +142,8 @@ pub struct ResponderKeys<'a> {
 /// The responder's result.
 pub struct Response {
     pub sk: Zeroizing<[u8; 32]>,
+    /// `S_ses` (design P1 §3.3) from this SK and AD.
+    pub s_ses: Zeroizing<[u8; 32]>,
     pub ad: Vec<u8>,
 }
 
@@ -249,14 +258,16 @@ pub fn initiate_with_rng<R: RngCore + CryptoRng>(
         &ct,
         peer.pq_spk.id,
     );
+    let ad = associated_data(
+        my_account,
+        &my_dev_dh.pub_bytes,
+        &peer.account,
+        &peer.dev_dh,
+    );
     Ok(Initiation {
+        s_ses: session_seed(&sk, &ad),
         sk,
-        ad: associated_data(
-            my_account,
-            &my_dev_dh.pub_bytes,
-            &peer.account,
-            &peer.dev_dh,
-        ),
+        ad,
         pq_spk_id: peer.pq_spk.id,
         ct,
         dev_dh: my_dev_dh.pub_bytes,
@@ -286,9 +297,11 @@ pub fn respond(
         &hs.ct,
         hs.pq_spk_id,
     );
+    let ad = associated_data(their_account, &hs.dev_dh, &me.account, &me.dev_dh.pub_bytes);
     Ok(Response {
+        s_ses: session_seed(&sk, &ad),
         sk,
-        ad: associated_data(their_account, &hs.dev_dh, &me.account, &me.dev_dh.pub_bytes),
+        ad,
     })
 }
 
@@ -324,8 +337,14 @@ pub struct Pq11Initiation {
     pub spk_id: u32,
 }
 
-/// The ciphertext for the type 4 body and `raíz'`.
-pub type Pq11Reply = (Box<[u8; CT_LEN]>, Zeroizing<[u8; 32]>);
+/// `raíz'` of a PQ-11 session and the `S_ses` that comes from it.
+pub struct Pq11Root {
+    pub root: Zeroizing<[u8; 32]>,
+    pub s_ses: Zeroizing<[u8; 32]>,
+}
+
+/// The ciphertext for the type 4 body and the new root.
+pub type Pq11Reply = (Box<[u8; CT_LEN]>, Pq11Root);
 
 /// The responder's side of a PQ-11 handshake.
 pub struct Pq11Response {
@@ -415,8 +434,12 @@ impl Pq11Initiation {
     }
 
     /// `raíz'` from the responder's ciphertext (the type 4 body).
-    pub fn finish(&self, ct: &[u8; CT_LEN]) -> Zeroizing<[u8; 32]> {
-        pq11_root(&self.sk0, &self.kem.decapsulate(ct), ct)
+    pub fn finish(&self, ct: &[u8; CT_LEN]) -> Pq11Root {
+        let root = pq11_root(&self.sk0, &self.kem.decapsulate(ct), ct);
+        Pq11Root {
+            s_ses: session_seed(&root, &self.ad),
+            root,
+        }
     }
 }
 
@@ -429,7 +452,13 @@ impl Pq11Response {
     ) -> Result<Pq11Reply, PqxdhError> {
         let (ct, ss) = encapsulate_with_rng(&self.pq_ek, rng)?;
         let root = pq11_root(&self.sk0, &ss, &ct);
-        Ok((ct, root))
+        Ok((
+            ct,
+            Pq11Root {
+                s_ses: session_seed(&root, &self.ad),
+                root,
+            },
+        ))
     }
 }
 
@@ -884,7 +913,7 @@ mod tests {
             b"device list only"
         );
         let (ct, root1) = resp.reply_with_rng(&mut rng).unwrap();
-        let mut b1 = init_initiator(*root1, hs.message.dh).unwrap();
+        let mut b1 = init_initiator(*root1.root, hs.message.dh).unwrap();
         let r = ratchet_encrypt(&mut b1, b"hola", &resp.ad).unwrap();
         let reply = KemReplyBody::decode(
             &KemReplyBody {
@@ -898,8 +927,8 @@ mod tests {
         // Alice: the ciphertext gives the same root; her ratchet restarts
         // from it with the DH key she used in message 0.
         let root1_a = init.finish(&reply.ct);
-        assert_eq!(*root1_a, *root1);
-        let mut a1 = init_responder(*root1_a, a0.dhs.clone());
+        assert_eq!(*root1_a.root, *root1.root);
+        let mut a1 = init_responder(*root1_a.root, a0.dhs.clone());
         assert_eq!(
             ratchet_decrypt(&mut a1, &reply.message.to_ratchet(), &init.ad).unwrap(),
             b"hola"
@@ -910,7 +939,7 @@ mod tests {
             b"que tal"
         );
         // SK0 alone does not give root1.
-        assert_ne!(*init.sk0, *root1);
+        assert_ne!(*init.sk0, *root1.root);
     }
 
     #[test]
@@ -935,7 +964,7 @@ mod tests {
         // A flipped ciphertext bit gives another root on the initiator.
         let (mut ct, root1) = good.reply_with_rng(&mut rng).unwrap();
         ct[3] ^= 1;
-        assert_ne!(*init.finish(&ct), *root1);
+        assert_ne!(*init.finish(&ct).root, *root1.root);
         // Refused: another suite, a one-time prekey, a malformed ephemeral
         // key, a bad SPK signature.
         let mut bad = hs.clone();
@@ -964,6 +993,31 @@ mod tests {
             initiate_pq11_with_rng(&[9; 32], &x_pair([8; 32]), &p, &mut rng).err(),
             Some(PqxdhError::Spk)
         );
+    }
+
+    #[test]
+    fn both_sides_get_the_same_session_seed_in_both_modes() {
+        use crate::p1::mailbox::session_seed;
+        let mut rng = ChaCha20Rng::from_seed([13; 32]);
+        let bob = Bob::new(&mut rng);
+        let alice_dh = x_pair([8; 32]);
+        let init = initiate_with_rng(&[9; 32], &alice_dh, &bob.prekeys(), &mut rng).unwrap();
+        let resp = respond(&bob.keys(), &[9; 32], &init.handshake(sample_message())).unwrap();
+        assert_eq!(*init.s_ses, *resp.s_ses);
+        assert_eq!(*init.s_ses, *session_seed(&init.sk, &init.ad));
+        // PQ-11: S_ses comes from root', never from SK0.
+        let init = initiate_pq11_with_rng(&[9; 32], &alice_dh, &classical(&bob), &mut rng).unwrap();
+        let resp = respond_pq11(
+            &classical_keys(&bob),
+            &[9; 32],
+            &init.handshake(sample_message()),
+        )
+        .unwrap();
+        let (ct, theirs) = resp.reply_with_rng(&mut rng).unwrap();
+        let ours = init.finish(&ct);
+        assert_eq!(*ours.s_ses, *theirs.s_ses);
+        assert_eq!(*ours.s_ses, *session_seed(&ours.root, &init.ad));
+        assert_ne!(*ours.s_ses, *session_seed(&init.sk0, &init.ad));
     }
 
     #[test]
