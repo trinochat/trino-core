@@ -98,6 +98,42 @@ def main():
                 "ad": ad.hex(),
             }
         )
+    # PQ-11 (§21.6): the initiator brings an ephemeral ML-KEM key; SK0 has no
+    # KEM secret, and the responder's ciphertext moves the root to root1.
+    #   SK0   = HKDF(salt = 32 zeros, 0xFF*32 || DH1 || DH2 || DH3,
+    #              info = "trino/pqxdh/v1/pq11" || suite || SHA-256(pq_ek_eph))
+    #   root1 = HKDF(salt = SK0, ikm = SS, info = "trino/pq11/v1" || SHA-256(ct))
+    out["pq11"] = []
+    for i in range(3):
+        dev_ini, dev_ini_priv, dev_ini_pub = x_pair(f"trino/pq11/dev_ini/{i}")
+        ek, ek_priv, ek_pub = x_pair(f"trino/pq11/ek/{i}")
+        dev_resp, dev_resp_priv, dev_resp_pub = x_pair(f"trino/pq11/dev_resp/{i}")
+        spk, spk_priv, spk_pub = x_pair(f"trino/pq11/spk/{i}")
+        eph_seed = hashlib.sha256(f"trino/pq11/eph/{i}".encode()).digest() * 2
+        eph = mlkem.MLKEM768PrivateKey.from_seed_bytes(eph_seed)
+        pq_ek = eph.public_key().public_bytes(s.Encoding.Raw, s.PublicFormat.Raw)
+        dh1, dh2, dh3 = dh(dev_ini, spk_pub), dh(ek, dev_resp_pub), dh(ek, spk_pub)
+        sk0 = HKDF(
+            hashes.SHA256(),
+            32,
+            b"\x00" * 32,
+            b"trino/pqxdh/v1/pq11" + bytes([SUITE]) + hashlib.sha256(pq_ek).digest(),
+        ).derive(b"\xff" * 32 + dh1 + dh2 + dh3)
+        ss, ct = eph.public_key().encapsulate()
+        root1 = HKDF(hashes.SHA256(), 32, sk0, b"trino/pq11/v1" + hashlib.sha256(ct).digest()).derive(ss)
+        out["pq11"].append(
+            {
+                "dev_dh_ini_priv": dev_ini_priv.hex(),
+                "ek_priv": ek_priv.hex(),
+                "dev_dh_resp_priv": dev_resp_priv.hex(),
+                "spk_priv": spk_priv.hex(),
+                "eph_seed": eph_seed.hex(),
+                "sk0": sk0.hex(),
+                "ct": ct.hex(),
+                "ss": ss.hex(),
+                "root1": root1.hex(),
+            }
+        )
     json.dump(out, sys.stdout, indent=2)
     sys.stdout.write("\n")
 

@@ -27,6 +27,26 @@
 //! - **Randomness is injectable**: `initiate_with_rng` draws 32 bytes for
 //!   the ephemeral key, then 32 for the encapsulation.
 //!
+//! **PQ-11 mode** (§21.6), when the initiator has no `pq_spk` of the other
+//! device (a group member who is not a contact, a contact whose full
+//! `DeviceList` has not arrived, a direct `trino3:` code):
+//!
+//! ```text
+//! type 5 = suite ‖ pq_ek_eph ‖ dev_dh ‖ ek ‖ spk_id ‖ opk_id ‖ message 0 (no user text)
+//! SK₀    = HKDF(salt = 32 zero bytes, 0xFF×32 ‖ DH1 ‖ DH2 ‖ DH3,
+//!               info = "trino/pqxdh/v1/pq11" ‖ suite ‖ SHA-256(pq_ek_eph))
+//! type 4 = ct ‖ first reply,  with (SS, ct) = Encaps(pq_ek_eph)
+//! root'  = HKDF(salt = SK₀, ikm = SS, info = "trino/pq11/v1" ‖ SHA-256(ct))
+//! ```
+//!
+//! "The root" of §21.6 is taken to be `SK₀`, and both ratchets restart
+//! from `root'`: the responder as the ratchet's initiator, against the
+//! ratchet key in message 0's header; the initiator as its responder, with
+//! the key pair it used for message 0. Only message 0, which carries no
+//! user text, stays under `SK₀`; the reply is already hybrid. `S_ses` comes
+//! from `root'`, so the type 4 travels on the introduction mailbox: the
+//! initiator cannot compute the session one before opening it.
+//!
 //! Not here yet: that `dev_dh_ini` belongs to `A_ini`'s device list (§5.1,
 //! RV-06) is checked by the device list code (VI-1), and `S_ses` comes from
 //! `SK` in P1-5.
@@ -36,8 +56,8 @@
 
 use crate::crypto::{hkdf_expand, sha256};
 use crate::identity::{ed25519_sign, KeyPair};
-use crate::kem::{encapsulate_with_rng, KemError, KemSecret, CT_LEN};
-use crate::p1::wire::{HandshakeBody, MessageBody, SUITE_X25519_MLKEM768};
+use crate::kem::{encapsulate_with_rng, KemError, KemSecret, CT_LEN, EK_LEN};
+use crate::p1::wire::{HandshakeBody, HandshakePq11Body, MessageBody, SUITE_X25519_MLKEM768};
 use crate::pq_spk::{PqSpkError, SignedPqPrekey};
 use ed25519_dalek::{Signature, VerifyingKey};
 use rand_core::{CryptoRng, RngCore};
@@ -53,6 +73,8 @@ pub const SIGNED_SPK_LEN: usize = 4 + 32 + 64;
 const SPK_DOMAIN: &[u8] = b"trino/spk/v2\0";
 const AD_LABEL: &[u8] = b"trino/x3dh/v2\0";
 const INFO_LABEL: &[u8] = b"trino/pqxdh/v1";
+const PQ11_INFO_LABEL: &[u8] = b"trino/pqxdh/v1/pq11";
+const PQ11_ROOT_LABEL: &[u8] = b"trino/pq11/v1";
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum PqxdhError {
@@ -181,22 +203,13 @@ pub fn combine(
     ct: &[u8; CT_LEN],
     pq_spk_id: u32,
 ) -> Zeroizing<[u8; 32]> {
-    let mut ikm = Zeroizing::new(Vec::with_capacity(32 * 5));
-    ikm.extend_from_slice(&[0xFF; 32]);
-    for d in dh {
-        ikm.extend_from_slice(d);
-    }
-    ikm.extend_from_slice(ss);
     let mut info = Vec::with_capacity(INFO_LABEL.len() + 1 + 32 + 32 + 4);
     info.extend_from_slice(INFO_LABEL);
     info.push(SUITE);
     info.extend_from_slice(&sha256(pq_ek));
     info.extend_from_slice(&sha256(ct));
     info.extend_from_slice(&pq_spk_id.to_be_bytes());
-    let okm = hkdf_expand(&ikm, &[0u8; 32], &info, 32).expect("32 bytes is a valid HKDF length");
-    let mut sk = Zeroizing::new([0u8; 32]);
-    sk.copy_from_slice(&okm);
-    sk
+    hkdf32(&ikm_of(dh, Some(ss)), &[0u8; 32], &info)
 }
 
 /// `AD`: the suite, both accounts and both device keys.
@@ -227,13 +240,7 @@ pub fn initiate_with_rng<R: RngCore + CryptoRng>(
     peer.spk.verify(&peer.dev_sign)?;
     peer.pq_spk.verify(&peer.dev_sign)?;
 
-    let mut ek_priv = Zeroizing::new([0u8; 32]);
-    rng.fill_bytes(&mut ek_priv[..]);
-    // StaticSecret wipes itself on drop.
-    let ek = StaticSecret::from(*ek_priv);
-    let dh1 = x25519(&StaticSecret::from(my_dev_dh.priv_bytes), &peer.spk.public)?;
-    let dh2 = x25519(&ek, &peer.dev_dh)?;
-    let dh3 = x25519(&ek, &peer.spk.public)?;
+    let (ek, [dh1, dh2, dh3]) = initiator_dh(my_dev_dh, &peer.dev_dh, &peer.spk.public, rng)?;
     let (ct, ss) = encapsulate_with_rng(&peer.pq_spk.ek, rng)?;
     let sk = combine(
         [&dh1, &dh2, &dh3],
@@ -253,7 +260,7 @@ pub fn initiate_with_rng<R: RngCore + CryptoRng>(
         pq_spk_id: peer.pq_spk.id,
         ct,
         dev_dh: my_dev_dh.pub_bytes,
-        ek: XPublicKey::from(&ek).to_bytes(),
+        ek,
         spk_id: peer.spk.id,
     })
 }
@@ -270,10 +277,7 @@ pub fn respond(
     if hs.opk_id.is_some() {
         return Err(PqxdhError::OneTimePrekey);
     }
-    let spk = StaticSecret::from(me.spk.priv_bytes);
-    let dh1 = x25519(&spk, &hs.dev_dh)?;
-    let dh2 = x25519(&StaticSecret::from(me.dev_dh.priv_bytes), &hs.ek)?;
-    let dh3 = x25519(&spk, &hs.ek)?;
+    let [dh1, dh2, dh3] = responder_dh(me.dev_dh, me.spk, &hs.dev_dh, &hs.ek)?;
     let ss = me.pq.decapsulate(&hs.ct);
     let sk = combine(
         [&dh1, &dh2, &dh3],
@@ -286,6 +290,202 @@ pub fn respond(
         sk,
         ad: associated_data(their_account, &hs.dev_dh, &me.account, &me.dev_dh.pub_bytes),
     })
+}
+
+// ---------------------------------------------------------------- PQ-11
+
+/// What the initiator holds of a device whose `pq_spk` it does not have:
+/// a group member who is not a contact yet, or a contact whose full
+/// `DeviceList` has not arrived (§21.6).
+pub struct PeerClassical {
+    pub account: [u8; 32],
+    pub dev_sign: [u8; 32],
+    pub dev_dh: [u8; 32],
+    pub spk: SignedSpk,
+}
+
+/// The responding device's classical keys for a PQ-11 handshake.
+pub struct ClassicalResponderKeys<'a> {
+    pub account: [u8; 32],
+    pub dev_dh: &'a KeyPair,
+    pub spk: &'a KeyPair,
+}
+
+/// The initiator's side of a PQ-11 handshake. It keeps the ephemeral KEM
+/// key until the type 4 reply arrives, then [`Pq11Initiation::finish`].
+pub struct Pq11Initiation {
+    /// `SK₀`: protects only message 0, which carries no user text.
+    pub sk0: Zeroizing<[u8; 32]>,
+    pub ad: Vec<u8>,
+    pub kem: KemSecret,
+    pub pq_ek: Box<[u8; EK_LEN]>,
+    pub dev_dh: [u8; 32],
+    pub ek: [u8; 32],
+    pub spk_id: u32,
+}
+
+/// The ciphertext for the type 4 body and `raíz'`.
+pub type Pq11Reply = (Box<[u8; CT_LEN]>, Zeroizing<[u8; 32]>);
+
+/// The responder's side of a PQ-11 handshake.
+pub struct Pq11Response {
+    pub sk0: Zeroizing<[u8; 32]>,
+    pub ad: Vec<u8>,
+    pq_ek: Box<[u8; EK_LEN]>,
+}
+
+/// `SK₀` of PQ-11: the three Diffie-Hellman results only, bound to the
+/// initiator's ephemeral KEM key.
+pub fn combine_pq11(dh: [&[u8; 32]; 3], pq_ek: &[u8; EK_LEN]) -> Zeroizing<[u8; 32]> {
+    let mut info = Vec::with_capacity(PQ11_INFO_LABEL.len() + 1 + 32);
+    info.extend_from_slice(PQ11_INFO_LABEL);
+    info.push(SUITE);
+    info.extend_from_slice(&sha256(pq_ek));
+    hkdf32(&ikm_of(dh, None), &[0u8; 32], &info)
+}
+
+/// `raíz' = HKDF(salt = SK₀, ikm = SS, info = "trino/pq11/v1" ‖ SHA-256(ct))`.
+pub fn pq11_root(sk0: &[u8; 32], ss: &[u8; 32], ct: &[u8; CT_LEN]) -> Zeroizing<[u8; 32]> {
+    let mut info = Vec::with_capacity(PQ11_ROOT_LABEL.len() + 32);
+    info.extend_from_slice(PQ11_ROOT_LABEL);
+    info.extend_from_slice(&sha256(ct));
+    hkdf32(ss, sk0, &info)
+}
+
+/// Starts a PQ-11 handshake. Draws 32 bytes for the X25519 ephemeral key,
+/// then 64 for the ML-KEM one.
+pub fn initiate_pq11_with_rng<R: RngCore + CryptoRng>(
+    my_account: &[u8; 32],
+    my_dev_dh: &KeyPair,
+    peer: &PeerClassical,
+    rng: &mut R,
+) -> Result<Pq11Initiation, PqxdhError> {
+    peer.spk.verify(&peer.dev_sign)?;
+    let (ek, [dh1, dh2, dh3]) = initiator_dh(my_dev_dh, &peer.dev_dh, &peer.spk.public, rng)?;
+    let kem = KemSecret::generate_with_rng(rng);
+    let pq_ek = kem.public_key();
+    Ok(Pq11Initiation {
+        sk0: combine_pq11([&dh1, &dh2, &dh3], &pq_ek),
+        ad: associated_data(
+            my_account,
+            &my_dev_dh.pub_bytes,
+            &peer.account,
+            &peer.dev_dh,
+        ),
+        kem,
+        pq_ek,
+        dev_dh: my_dev_dh.pub_bytes,
+        ek,
+        spk_id: peer.spk.id,
+    })
+}
+
+/// Answers a PQ-11 handshake from account `their_account`.
+pub fn respond_pq11(
+    me: &ClassicalResponderKeys,
+    their_account: &[u8; 32],
+    hs: &HandshakePq11Body,
+) -> Result<Pq11Response, PqxdhError> {
+    if hs.suite != SUITE {
+        return Err(PqxdhError::Suite(hs.suite));
+    }
+    if hs.opk_id.is_some() {
+        return Err(PqxdhError::OneTimePrekey);
+    }
+    let [dh1, dh2, dh3] = responder_dh(me.dev_dh, me.spk, &hs.dev_dh, &hs.ek)?;
+    Ok(Pq11Response {
+        sk0: combine_pq11([&dh1, &dh2, &dh3], &hs.pq_ek),
+        ad: associated_data(their_account, &hs.dev_dh, &me.account, &me.dev_dh.pub_bytes),
+        pq_ek: hs.pq_ek.clone(),
+    })
+}
+
+impl Pq11Initiation {
+    /// The type 5 body. `message` must carry no user text (§21.6).
+    pub fn handshake(&self, message: MessageBody) -> HandshakePq11Body {
+        HandshakePq11Body {
+            suite: SUITE,
+            pq_ek: self.pq_ek.clone(),
+            dev_dh: self.dev_dh,
+            ek: self.ek,
+            spk_id: self.spk_id,
+            opk_id: None,
+            message,
+        }
+    }
+
+    /// `raíz'` from the responder's ciphertext (the type 4 body).
+    pub fn finish(&self, ct: &[u8; CT_LEN]) -> Zeroizing<[u8; 32]> {
+        pq11_root(&self.sk0, &self.kem.decapsulate(ct), ct)
+    }
+}
+
+impl Pq11Response {
+    /// Encapsulates to the initiator's key and returns the ciphertext for
+    /// the type 4 body and `raíz'`, mixed in before anything is encrypted.
+    pub fn reply_with_rng<R: RngCore + CryptoRng>(
+        &self,
+        rng: &mut R,
+    ) -> Result<Pq11Reply, PqxdhError> {
+        let (ct, ss) = encapsulate_with_rng(&self.pq_ek, rng)?;
+        let root = pq11_root(&self.sk0, &ss, &ct);
+        Ok((ct, root))
+    }
+}
+
+/// The ephemeral key and the three X25519 results of the initiator.
+type InitiatorDh = ([u8; 32], [Zeroizing<[u8; 32]>; 3]);
+
+/// The initiator's half: a fresh X25519 ephemeral key from 32 bytes of
+/// `rng`, then DH1, DH2 and DH3.
+fn initiator_dh<R: RngCore + CryptoRng>(
+    my_dev_dh: &KeyPair,
+    their_dev_dh: &[u8; 32],
+    their_spk: &[u8; 32],
+    rng: &mut R,
+) -> Result<InitiatorDh, PqxdhError> {
+    let mut ek_priv = Zeroizing::new([0u8; 32]);
+    rng.fill_bytes(&mut ek_priv[..]);
+    // StaticSecret wipes itself on drop.
+    let ek = StaticSecret::from(*ek_priv);
+    let dh1 = x25519(&StaticSecret::from(my_dev_dh.priv_bytes), their_spk)?;
+    let dh2 = x25519(&ek, their_dev_dh)?;
+    let dh3 = x25519(&ek, their_spk)?;
+    Ok((XPublicKey::from(&ek).to_bytes(), [dh1, dh2, dh3]))
+}
+
+/// The responder's half of the same three exchanges.
+fn responder_dh(
+    my_dev_dh: &KeyPair,
+    my_spk: &KeyPair,
+    their_dev_dh: &[u8; 32],
+    their_ek: &[u8; 32],
+) -> Result<[Zeroizing<[u8; 32]>; 3], PqxdhError> {
+    let spk = StaticSecret::from(my_spk.priv_bytes);
+    Ok([
+        x25519(&spk, their_dev_dh)?,
+        x25519(&StaticSecret::from(my_dev_dh.priv_bytes), their_ek)?,
+        x25519(&spk, their_ek)?,
+    ])
+}
+
+fn hkdf32(ikm: &[u8], salt: &[u8], info: &[u8]) -> Zeroizing<[u8; 32]> {
+    let okm = hkdf_expand(ikm, salt, info, 32).expect("32 bytes is a valid HKDF length");
+    let mut out = Zeroizing::new([0u8; 32]);
+    out.copy_from_slice(&okm);
+    out
+}
+
+fn ikm_of(dh: [&[u8; 32]; 3], ss: Option<&[u8; 32]>) -> Zeroizing<Vec<u8>> {
+    let mut ikm = Zeroizing::new(Vec::with_capacity(32 * 5));
+    ikm.extend_from_slice(&[0xFF; 32]);
+    for d in dh {
+        ikm.extend_from_slice(d);
+    }
+    if let Some(ss) = ss {
+        ikm.extend_from_slice(ss);
+    }
+    ikm
 }
 
 fn spk_message(id: u32, public: &[u8; 32]) -> Vec<u8> {
@@ -598,6 +798,183 @@ mod tests {
         assert_eq!(
             initiate_with_rng(&[9; 32], &x_pair([8; 32]), &p, &mut rng).err(),
             Some(PqxdhError::NonContributory)
+        );
+    }
+
+    // ------------------------------------------------------------ PQ-11
+
+    fn classical(bob: &Bob) -> PeerClassical {
+        PeerClassical {
+            account: bob.account,
+            dev_sign: bob.dev_sign.pub_bytes,
+            dev_dh: bob.dev_dh.pub_bytes,
+            spk: SignedSpk::sign(&bob.dev_sign, 5, &bob.spk.pub_bytes),
+        }
+    }
+
+    fn classical_keys(bob: &Bob) -> ClassicalResponderKeys<'_> {
+        ClassicalResponderKeys {
+            account: bob.account,
+            dev_dh: &bob.dev_dh,
+            spk: &bob.spk,
+        }
+    }
+
+    #[test]
+    fn pq11_sk0_and_root_match_openssl() {
+        let v: Value = serde_json::from_str(VECTORS).unwrap();
+        for c in v["pq11"].as_array().unwrap() {
+            let ini = x_pair(hx(&c["dev_dh_ini_priv"]));
+            let ek = x_pair(hx(&c["ek_priv"]));
+            let resp = x_pair(hx(&c["dev_dh_resp_priv"]));
+            let spk = x_pair(hx(&c["spk_priv"]));
+            let eph = KemSecret::from_seed(&hx(&c["eph_seed"]));
+            let pq_ek = eph.public_key();
+            // The responder computes SK0 from the type 5 fields.
+            let hs = HandshakePq11Body {
+                suite: SUITE,
+                pq_ek: pq_ek.clone(),
+                dev_dh: ini.pub_bytes,
+                ek: ek.pub_bytes,
+                spk_id: 5,
+                opk_id: None,
+                message: sample_message(),
+            };
+            let me = ClassicalResponderKeys {
+                account: [1; 32],
+                dev_dh: &resp,
+                spk: &spk,
+            };
+            let r = respond_pq11(&me, &[2; 32], &hs).unwrap();
+            assert_eq!(*r.sk0, hx::<32>(&c["sk0"]));
+            // The initiator opens OpenSSL's ciphertext and reaches root1.
+            let ct: [u8; CT_LEN] = hx(&c["ct"]);
+            let ss = eph.decapsulate(&ct);
+            assert_eq!(*ss, hx::<32>(&c["ss"]));
+            assert_eq!(*pq11_root(&r.sk0, &ss, &ct), hx::<32>(&c["root1"]));
+        }
+    }
+
+    #[test]
+    fn a_pq11_session_runs_both_ways_after_the_reply() {
+        use crate::p1::wire::KemReplyBody;
+        use crate::ratchet::{init_initiator, init_responder, ratchet_decrypt, ratchet_encrypt};
+        let mut rng = ChaCha20Rng::from_seed([11; 32]);
+        let bob = Bob::new(&mut rng);
+        let alice_account = [9u8; 32];
+        let alice_dh = x_pair([8; 32]);
+
+        // Alice: type 5 with message 0 under SK0 (no user text in it).
+        let init =
+            initiate_pq11_with_rng(&alice_account, &alice_dh, &classical(&bob), &mut rng).unwrap();
+        let mut a0 = init_initiator(*init.sk0, bob.spk.pub_bytes).unwrap();
+        let m0 = ratchet_encrypt(&mut a0, b"device list only", &init.ad).unwrap();
+        let hs = HandshakePq11Body::decode(
+            &init
+                .handshake(MessageBody::from_ratchet(&m0).unwrap())
+                .encode(),
+        )
+        .unwrap();
+
+        // Bob: opens message 0, then mixes the KEM before replying.
+        let resp = respond_pq11(&classical_keys(&bob), &alice_account, &hs).unwrap();
+        let mut b0 = init_responder(*resp.sk0, bob.spk.clone());
+        assert_eq!(
+            ratchet_decrypt(&mut b0, &hs.message.to_ratchet(), &resp.ad).unwrap(),
+            b"device list only"
+        );
+        let (ct, root1) = resp.reply_with_rng(&mut rng).unwrap();
+        let mut b1 = init_initiator(*root1, hs.message.dh).unwrap();
+        let r = ratchet_encrypt(&mut b1, b"hola", &resp.ad).unwrap();
+        let reply = KemReplyBody::decode(
+            &KemReplyBody {
+                ct,
+                message: MessageBody::from_ratchet(&r).unwrap(),
+            }
+            .encode(),
+        )
+        .unwrap();
+
+        // Alice: the ciphertext gives the same root; her ratchet restarts
+        // from it with the DH key she used in message 0.
+        let root1_a = init.finish(&reply.ct);
+        assert_eq!(*root1_a, *root1);
+        let mut a1 = init_responder(*root1_a, a0.dhs.clone());
+        assert_eq!(
+            ratchet_decrypt(&mut a1, &reply.message.to_ratchet(), &init.ad).unwrap(),
+            b"hola"
+        );
+        let back = ratchet_encrypt(&mut a1, b"que tal", &init.ad).unwrap();
+        assert_eq!(
+            ratchet_decrypt(&mut b1, &back, &resp.ad).unwrap(),
+            b"que tal"
+        );
+        // SK0 alone does not give root1.
+        assert_ne!(*init.sk0, *root1);
+    }
+
+    #[test]
+    fn pq11_binds_the_ephemeral_key_and_the_ciphertext() {
+        let mut rng = ChaCha20Rng::from_seed([12; 32]);
+        let bob = Bob::new(&mut rng);
+        let init =
+            initiate_pq11_with_rng(&[9; 32], &x_pair([8; 32]), &classical(&bob), &mut rng).unwrap();
+        let hs = init.handshake(sample_message());
+        let good = respond_pq11(&classical_keys(&bob), &[9; 32], &hs).unwrap();
+        assert_eq!(*good.sk0, *init.sk0);
+        assert_eq!(good.ad, init.ad);
+        // A swapped ephemeral key changes SK0.
+        let mut other = hs.clone();
+        other.pq_ek = KemSecret::from_seed(&[1; 64]).public_key();
+        assert_ne!(
+            *respond_pq11(&classical_keys(&bob), &[9; 32], &other)
+                .unwrap()
+                .sk0,
+            *good.sk0
+        );
+        // A flipped ciphertext bit gives another root on the initiator.
+        let (mut ct, root1) = good.reply_with_rng(&mut rng).unwrap();
+        ct[3] ^= 1;
+        assert_ne!(*init.finish(&ct), *root1);
+        // Refused: another suite, a one-time prekey, a malformed ephemeral
+        // key, a bad SPK signature.
+        let mut bad = hs.clone();
+        bad.suite = 2;
+        assert_eq!(
+            respond_pq11(&classical_keys(&bob), &[9; 32], &bad).err(),
+            Some(PqxdhError::Suite(2))
+        );
+        let mut bad = hs.clone();
+        bad.opk_id = Some(3);
+        assert_eq!(
+            respond_pq11(&classical_keys(&bob), &[9; 32], &bad).err(),
+            Some(PqxdhError::OneTimePrekey)
+        );
+        let mut bad = hs.clone();
+        bad.pq_ek[0] = 0xFF;
+        bad.pq_ek[1] |= 0x0F;
+        let r = respond_pq11(&classical_keys(&bob), &[9; 32], &bad).unwrap();
+        assert_eq!(
+            r.reply_with_rng(&mut rng).err(),
+            Some(PqxdhError::Kem(KemError::InvalidKey))
+        );
+        let mut p = classical(&bob);
+        p.spk.sig[1] ^= 1;
+        assert_eq!(
+            initiate_pq11_with_rng(&[9; 32], &x_pair([8; 32]), &p, &mut rng).err(),
+            Some(PqxdhError::Spk)
+        );
+    }
+
+    #[test]
+    fn pq11_and_the_normal_handshake_never_share_a_secret() {
+        // Same DH inputs, but the labels differ: SK0 is not an SK.
+        let dh = [&[1u8; 32], &[2u8; 32], &[3u8; 32]];
+        let pq_ek = KemSecret::from_seed(&[4; 64]).public_key();
+        let ct = [5u8; CT_LEN];
+        assert_ne!(
+            *combine_pq11(dh, &pq_ek),
+            *combine(dh, &[0; 32], &pq_ek[..], &ct, 0)
         );
     }
 }
