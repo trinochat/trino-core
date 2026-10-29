@@ -28,6 +28,8 @@
 
 mod words;
 
+use crate::kdf::{KdfError, KdfParams};
+use hkdf::Hkdf;
 use rand_core::{CryptoRng, OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use std::fmt;
@@ -40,6 +42,26 @@ pub const ENTROPY_LEN: usize = 15;
 pub const WORD_COUNT: usize = 12;
 
 const CHECK_DOMAIN: &[u8] = b"trino/kit/v1/check";
+const KDF_SALT: &[u8] = b"trino/kit/v1";
+const INFO_RESERVE: &[u8] = b"trino/kit/v1/reserve";
+const INFO_CHECK_LOCAL: &[u8] = b"trino/kit/v1/check-local";
+
+/// Argon2id for the kit: 64 MiB, 3 passes, 1 lane (`Recuperacion/diseno.md`
+/// §3.2). Fixed for version 1 of the kit, because the sheet cannot carry
+/// them: changing them means `trino/kit/v2`. One lane, not the vault's four,
+/// because the kit is opened on a phone (S-VI5 measures it there).
+pub const KIT_KDF: KdfParams = KdfParams {
+    m_kib: 64 * 1024,
+    t: 3,
+    p: 1,
+};
+
+/// What the kit opens. `k_reserva` wraps the reserve key and is never
+/// stored; `h_check` is stored to test the sheet later without the words.
+pub struct KitKeys {
+    pub k_reserva: Zeroizing<[u8; 32]>,
+    pub h_check: [u8; 32],
+}
 
 /// The language of a word list.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -144,6 +166,34 @@ impl Kit {
     /// [`KitError::ByColumns`] and a yes).
     pub fn parse_by_columns(text: &str) -> Result<(Kit, Language), KitError> {
         read(text, &Language::ALL, true)
+    }
+
+    /// `K = Argon2id(E)`, and from it `k_reserva` and `h_check` with HKDF.
+    /// `K` is wiped before returning: only these two leave.
+    pub fn derive(&self) -> Result<KitKeys, KdfError> {
+        // A build with `test-kdf` (app tests only, never a release) derives
+        // with the cheap parameters, like the vault does.
+        #[cfg(feature = "test-kdf")]
+        let k = crate::kdf::argon2id_test(&self.entropy[..], KDF_SALT)?;
+        #[cfg(not(feature = "test-kdf"))]
+        let k = crate::kdf::argon2id(&self.entropy[..], KDF_SALT, &KIT_KDF)?;
+        let hk = Hkdf::<Sha256>::new(None, &k[..]);
+        let mut keys = KitKeys {
+            k_reserva: Zeroizing::new([0u8; 32]),
+            h_check: [0u8; 32],
+        };
+        hk.expand(INFO_RESERVE, &mut keys.k_reserva[..])
+            .expect("32 bytes is a valid HKDF-SHA256 length");
+        hk.expand(INFO_CHECK_LOCAL, &mut keys.h_check)
+            .expect("32 bytes is a valid HKDF-SHA256 length");
+        Ok(keys)
+    }
+
+    /// Whether these are the words of the kit whose `h_check` is stored: the
+    /// "check your sheet" drill. Costs one Argon2id.
+    pub fn matches(&self, h_check: &[u8; 32]) -> Result<bool, KdfError> {
+        let keys = self.derive()?;
+        Ok(ct_eq(&keys.h_check, h_check))
     }
 }
 
@@ -272,6 +322,11 @@ fn read(text: &str, langs: &[Language], by_columns: bool) -> Result<(Kit, Langua
         0 => Err(KitError::Checksum),
         _ => Err(KitError::Ambiguous),
     }
+}
+
+/// Compares two values without stopping at the first difference.
+fn ct_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    a.iter().zip(b).fold(0u8, |diff, (x, y)| diff | (x ^ y)) == 0
 }
 
 /// The 12 check bits of `entropy`.
@@ -461,6 +516,40 @@ mod tests {
             Kit::parse_in(&typed, Language::En).unwrap().entropy(),
             &e15(&amb["en_entropy"])
         );
+    }
+
+    #[test]
+    #[cfg(not(feature = "test-kdf"))]
+    fn the_keys_match_the_independent_vectors() {
+        for case in vectors()["keys"].as_array().unwrap() {
+            let keys = Kit::from_entropy(e15(&case["entropy"])).derive().unwrap();
+            assert_eq!(
+                hex::encode(*keys.k_reserva),
+                case["k_reserva"].as_str().unwrap()
+            );
+            assert_eq!(hex::encode(keys.h_check), case["h_check"].as_str().unwrap());
+        }
+    }
+
+    #[test]
+    fn the_kit_kdf_is_within_the_bounds() {
+        assert_eq!(KIT_KDF.check(), Ok(()));
+    }
+
+    #[test]
+    #[cfg(not(feature = "test-kdf"))]
+    fn the_sheet_drill_tells_the_right_words_from_others() {
+        let case = &vectors()["keys"][1];
+        let h_check: [u8; 32] = hex::decode(case["h_check"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let typed = strings(&vectors()["words"][1]["pt"]).join(" ");
+        let (kit, _) = Kit::parse(&typed).unwrap();
+        assert!(kit.matches(&h_check).unwrap());
+        assert!(!Kit::from_entropy([0; ENTROPY_LEN])
+            .matches(&h_check)
+            .unwrap());
     }
 
     #[test]
