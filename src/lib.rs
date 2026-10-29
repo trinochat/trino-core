@@ -30,6 +30,7 @@ pub mod kdf;
 pub mod kem;
 pub mod nip44;
 pub mod p1;
+pub mod pq_spk;
 pub mod ratchet;
 pub mod totp;
 pub mod vault;

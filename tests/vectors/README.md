@@ -7,6 +7,7 @@
 | `p1_mailbox.json` | P1 mailboxes: `S_intro`, `S_ses`, epoch secrets and chain, mailbox keys, `k_mac`, `k_dedup`, low-order X25519 keys | Computed by `p1_mailbox.py` with Python's `cryptography` (OpenSSL). Rerunning the script prints the same file. |
 | `p1_wire.json` | P1 inner frames of types 1 to 4 at their steps, their MACs, and two type 3 bodies with a real 24-bit proof of work | Built byte by byte by `p1_wire.py` with Python's standard library (`hmac`, `hashlib`). Rerunning the script prints the same file (the proof of work search takes about a minute). |
 | `mlkem768.json` | ML-KEM-768: public keys from seeds, ciphertexts and shared secrets, and the implicit rejection of a flipped ciphertext | Made by OpenSSL 4.0.2 through `mlkem768.py` (Python's `cryptography` 50.0.1). Encapsulation is randomized there, so a rerun prints other ciphertexts; the tests read the committed file. |
+| `pq_spk.json` | Signed post-quantum prekeys: the ML-KEM-768 key from a seed and its deterministic Ed25519 signature | OpenSSL through `pq_spk.py`. Rerunning the script prints the same file. |
 
 ## Caveats
 
