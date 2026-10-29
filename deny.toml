@@ -50,3 +50,20 @@ yanked = "deny"
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
+
+[graph]
+# The targets Trino ships to. Without this list cargo-deny also follows
+# dependencies behind cfg(hax), which libcrux only uses for its formal
+# verification and no build compiles; one of them (hax-lib, through
+# proc-macro-error2) carries the unmaintained advisory RUSTSEC-2026-0173.
+targets = [
+    "x86_64-pc-windows-msvc",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "aarch64-linux-android",
+    "armv7-linux-androideabi",
+    "x86_64-linux-android",
+    "aarch64-apple-ios",
+]

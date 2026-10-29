@@ -40,6 +40,13 @@ zeroize = { version = "1", features = ["derive"] }
 # the crate's temporaries; kdf.rs wipes the memory matrix itself.
 argon2 = { version = "0.5.3", default-features = false, features = ["alloc", "zeroize"] }
 
+# ML-KEM-768 for the hybrid handshake (P1-18, PQ-03). Pinned to an exact
+# version: the API is pre-1.0 and the lock file is not versioned. Apache-2.0.
+libcrux-ml-kem = { version = "=0.0.11", default-features = false, features = ["mlkem768"] }
+# The DRBG that feeds ML-KEM and the injectable randomness (P1-18). The 0.3
+# line matches rand 0.8 and rand_core 0.6. MIT OR Apache-2.0.
+rand_chacha = "0.3"
+
 thiserror = "1"
 chrono = { version = "0.4", features = ["serde"] }
 
@@ -57,6 +64,9 @@ test-kdf = []
 
 [dev-dependencies]
 proptest = "1"
+# A second, independent ML-KEM-768, only to cross-check libcrux in the tests
+# (PQ-03). Never a runtime dependency. MIT OR Apache-2.0.
+ml-kem = { version = "=0.3.3", default-features = false, features = ["hazmat"] }
 
 # Tests derive real keys: PBKDF2 with 600 000 rounds for the version 1 and 2
 # vaults, and Argon2id at 64 MiB for version 3. Unoptimized, a single
