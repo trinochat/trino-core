@@ -4,6 +4,7 @@
 | --- | --- | --- |
 | `nip44.vectors.json` | NIP-44 v2: conversation keys, padded lengths, payloads, invalid inputs | Copied unchanged from the `nip44` crate 0.3.2 on crates.io (MIT, Michael Dilger; `src/nip44.vectors.json`, git `d3301d4`), which says it copies Paul Miller's vectors. SHA-256 `cedc7f554d62d700977eaced5e2656db52d9485826ab1024977ab8ca777eba57`. |
 | `nip44_bytes.json` | NIP-44 v2 over raw bytes and at the P1 size steps | Computed by `nip44_bytes.py` with Python's `cryptography` (OpenSSL). Rerunning the script prints the same file. |
+| `p1_mailbox.json` | P1 mailboxes: `S_intro`, `S_ses`, epoch secrets and chain, mailbox keys, `k_mac`, `k_dedup`, low-order X25519 keys | Computed by `p1_mailbox.py` with Python's `cryptography` (OpenSSL). Rerunning the script prints the same file. |
 
 ## Caveats
 

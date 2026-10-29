@@ -28,6 +28,7 @@ pub mod group;
 pub mod identity;
 pub mod kdf;
 pub mod nip44;
+pub mod p1;
 pub mod ratchet;
 pub mod totp;
 pub mod vault;
