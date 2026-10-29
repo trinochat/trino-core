@@ -8,6 +8,7 @@
 | `p1_wire.json` | P1 inner frames of types 1 to 4 at their steps, their MACs, and two type 3 bodies with a real 24-bit proof of work | Built byte by byte by `p1_wire.py` with Python's standard library (`hmac`, `hashlib`). Rerunning the script prints the same file (the proof of work search takes about a minute). |
 | `mlkem768.json` | ML-KEM-768: public keys from seeds, ciphertexts and shared secrets, and the implicit rejection of a flipped ciphertext | Made by OpenSSL 4.0.2 through `mlkem768.py` (Python's `cryptography` 50.0.1). Encapsulation is randomized there, so a rerun prints other ciphertexts; the tests read the committed file. |
 | `pq_spk.json` | Signed post-quantum prekeys: the ML-KEM-768 key from a seed and its deterministic Ed25519 signature | OpenSSL through `pq_spk.py`. Rerunning the script prints the same file. |
+| `pqxdh.json` | The hybrid handshake: the three X25519 results, an ML-KEM-768 ciphertext and secret, SK, AD and the `dev_sign` signature of the SPK | OpenSSL through `pqxdh.py` (X25519, ML-KEM-768, HKDF, Ed25519). Encapsulation is randomized there, so a rerun prints other ciphertexts and keys; the tests read the committed file. |
 
 ## Caveats
 
