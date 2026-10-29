@@ -22,9 +22,10 @@
 //! Every P1 size step `E` (1, 4, 16 and 40 KiB) is its own padded length,
 //! `calc_padded_len(E) = E`, so NIP-44 adds no step of its own on top of P1's.
 //!
-//! The tests check third-party vectors (the `nip44` crate's copy of Paul
-//! Miller's file) and independent byte vectors computed with OpenSSL
-//! (`tests/vectors/nip44_bytes.py`); see `tests/vectors/README.md`.
+//! The tests check the official vectors of the specification (Paul Miller's
+//! `nip44.vectors.json`, whose SHA-256 the NIP publishes) and independent
+//! byte vectors computed with OpenSSL (`tests/vectors/nip44_bytes.py`); see
+//! `tests/vectors/README.md`.
 
 use crate::crypto::random_array;
 use base64::Engine;
@@ -280,8 +281,47 @@ mod tests {
             assert_eq!(*conversation_key(&sec2, &xonly_of(&sec1)).unwrap(), *conv);
             let plaintext = c["plaintext"].as_str().unwrap().as_bytes();
             let payload = encrypt_with_nonce(&conv, plaintext, &h32(&c["nonce"])).unwrap();
-            assert_eq!(payload, c["ciphertext"].as_str().unwrap());
+            assert_eq!(payload, c["payload"].as_str().unwrap());
             assert_eq!(&decrypt(&conv, &payload).unwrap()[..], plaintext);
+        }
+    }
+
+    #[test]
+    fn third_party_message_keys() {
+        let set = &v2()["valid"]["get_message_keys"];
+        let conv = h32(&set["conversation_key"]);
+        for k in set["keys"].as_array().unwrap() {
+            let keys = message_keys(&conv, &h32(&k["nonce"]));
+            assert_eq!(*keys.chacha_key, h32(&k["chacha_key"]));
+            assert_eq!(
+                hex::encode(keys.chacha_nonce),
+                k["chacha_nonce"].as_str().unwrap()
+            );
+            assert_eq!(*keys.hmac_key, h32(&k["hmac_key"]));
+        }
+    }
+
+    #[test]
+    fn third_party_long_messages() {
+        use sha2::Digest;
+        for c in v2()["valid"]["encrypt_decrypt_long_msg"]
+            .as_array()
+            .unwrap()
+        {
+            let conv = h32(&c["conversation_key"]);
+            let repeat = c["repeat"].as_u64().unwrap() as usize;
+            let plaintext = c["pattern"].as_str().unwrap().repeat(repeat);
+            assert_eq!(
+                Sha256::digest(plaintext.as_bytes())[..],
+                h32(&c["plaintext_sha256"])
+            );
+            let payload =
+                encrypt_with_nonce(&conv, plaintext.as_bytes(), &h32(&c["nonce"])).unwrap();
+            assert_eq!(
+                Sha256::digest(payload.as_bytes())[..],
+                h32(&c["payload_sha256"])
+            );
+            assert_eq!(&decrypt(&conv, &payload).unwrap()[..], plaintext.as_bytes());
         }
     }
 
@@ -289,10 +329,25 @@ mod tests {
     fn third_party_invalid_payloads() {
         for c in v2()["invalid"]["decrypt"].as_array().unwrap() {
             let conv = h32(&c["conversation_key"]);
-            assert!(
-                decrypt(&conv, c["ciphertext"].as_str().unwrap()).is_err(),
-                "{}",
-                c["note"]
+            let note = c["note"].as_str().unwrap();
+            // The file names the reason; each one maps to its own error.
+            let want = if note.starts_with("unknown encryption version") {
+                Nip44Error::UnknownVersion
+            } else if note.starts_with("invalid base64") {
+                Nip44Error::InvalidBase64
+            } else if note.starts_with("invalid MAC") {
+                Nip44Error::InvalidMac
+            } else if note.starts_with("invalid padding") {
+                Nip44Error::InvalidPadding
+            } else if note.starts_with("invalid payload length") {
+                Nip44Error::PayloadLength
+            } else {
+                panic!("unexpected note {note}")
+            };
+            assert_eq!(
+                decrypt(&conv, c["payload"].as_str().unwrap()).err(),
+                Some(want),
+                "{note}"
             );
         }
     }
@@ -315,8 +370,10 @@ mod tests {
     #[test]
     fn third_party_payload_lengths() {
         let conv = [1u8; 32];
-        for n in v2()["invalid"]["decrypt_msg_lengths"].as_array().unwrap() {
-            let n = n.as_u64().unwrap() as usize;
+        // The `nip44` crate's copy of the vectors listed these decoded
+        // lengths; the official file covers them through the "invalid
+        // payload length" entries of `invalid.decrypt`.
+        for n in [0usize, 1, 2, 5, 10, 20, 32, 48, 64] {
             let as_text = "a".repeat(n);
             let as_bytes = base64::engine::general_purpose::STANDARD.encode(vec![2u8; n]);
             assert!(decrypt(&conv, &as_text).is_err(), "{n} characters");
