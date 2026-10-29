@@ -1,6 +1,11 @@
-use crate::crypto::{aes_gcm_decrypt, aes_gcm_encrypt, concat, hkdf_expand, CryptoError};
-use crate::identity::{generate_x25519, x25519_derive_shared, KeyPair};
+use crate::crypto::{
+    aes_gcm_decrypt, aes_gcm_encrypt_with_nonce, concat, hkdf_expand, CryptoError, NONCE_SIZE,
+};
+#[cfg(test)]
+use crate::identity::generate_x25519;
+use crate::identity::{x25519_derive_shared, KeyPair};
 use crate::p1::mailbox::{MailboxError, SessionChain};
+use rand_core::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
@@ -163,7 +168,28 @@ pub fn init_initiator(
     master_secret: [u8; 32],
     their_spk_pub: [u8; 32],
 ) -> Result<RatchetState, RatchetError> {
-    let dhs = generate_x25519();
+    init_initiator_with_rng(master_secret, their_spk_pub, &mut rand::thread_rng())
+}
+
+/// An X25519 key pair from 32 bytes of `rng`.
+fn x25519_from_rng<R: RngCore + CryptoRng>(rng: &mut R) -> KeyPair {
+    let mut seed = zeroize::Zeroizing::new([0u8; 32]);
+    rng.fill_bytes(&mut seed[..]);
+    let secret = x25519_dalek::StaticSecret::from(*seed);
+    KeyPair {
+        priv_bytes: secret.to_bytes(),
+        pub_bytes: x25519_dalek::PublicKey::from(&secret).to_bytes(),
+    }
+}
+
+/// `init_initiator` with the ratchet key drawn from `rng` (32 bytes), so
+/// fixed vectors can be shared with other implementations (§21.2).
+pub fn init_initiator_with_rng<R: RngCore + CryptoRng>(
+    master_secret: [u8; 32],
+    their_spk_pub: [u8; 32],
+    rng: &mut R,
+) -> Result<RatchetState, RatchetError> {
+    let dhs = x25519_from_rng(rng);
     let dh_out = x25519_derive_shared(&dhs.priv_bytes, &their_spk_pub);
     let (root_key, chain_key) = kdf_rk(&master_secret, &dh_out)?;
 
@@ -211,6 +237,18 @@ pub fn ratchet_encrypt(
     plaintext: &[u8],
     associated_data: &[u8],
 ) -> Result<EncryptedMessage, RatchetError> {
+    ratchet_encrypt_with_rng(state, plaintext, associated_data, &mut rand::thread_rng())
+}
+
+/// `ratchet_encrypt` with the AES-GCM nonce drawn from `rng` (12 bytes).
+/// Each message key encrypts exactly one message, so a nonce never repeats
+/// under a key even with a fixed generator.
+pub fn ratchet_encrypt_with_rng<R: RngCore + CryptoRng>(
+    state: &mut RatchetState,
+    plaintext: &[u8],
+    associated_data: &[u8],
+    rng: &mut R,
+) -> Result<EncryptedMessage, RatchetError> {
     let sending_ck = state
         .sending_chain_key
         .ok_or(RatchetError::NoSendingChain)?;
@@ -226,7 +264,9 @@ pub fn ratchet_encrypt(
 
     let header_bytes = encode_header(&header)?;
     let ad = concat(&[associated_data, &header_bytes]);
-    let (ciphertext, nonce) = aes_gcm_encrypt(&message_key, plaintext, Some(&ad))?;
+    let mut nonce = [0u8; NONCE_SIZE];
+    rng.fill_bytes(&mut nonce);
+    let ciphertext = aes_gcm_encrypt_with_nonce(&message_key, &nonce, plaintext, Some(&ad))?;
 
     Ok(EncryptedMessage {
         header,
@@ -240,10 +280,21 @@ pub fn ratchet_decrypt(
     msg: &EncryptedMessage,
     associated_data: &[u8],
 ) -> Result<Vec<u8>, RatchetError> {
+    ratchet_decrypt_with_rng(state, msg, associated_data, &mut rand::thread_rng())
+}
+
+/// `ratchet_decrypt` with the next ratchet key, if a DH step happens,
+/// drawn from `rng` (32 bytes).
+pub fn ratchet_decrypt_with_rng<R: RngCore + CryptoRng>(
+    state: &mut RatchetState,
+    msg: &EncryptedMessage,
+    associated_data: &[u8],
+    rng: &mut R,
+) -> Result<Vec<u8>, RatchetError> {
     // Transactional: roll back on any failure so a tampered, replayed or
     // undecryptable message can never corrupt the ratchet.
     let snapshot = state.clone();
-    match ratchet_decrypt_inner(state, msg, associated_data) {
+    match ratchet_decrypt_inner(state, msg, associated_data, rng) {
         Ok(pt) => Ok(pt),
         Err(e) => {
             *state = snapshot;
@@ -252,10 +303,11 @@ pub fn ratchet_decrypt(
     }
 }
 
-fn ratchet_decrypt_inner(
+fn ratchet_decrypt_inner<R: RngCore + CryptoRng>(
     state: &mut RatchetState,
     msg: &EncryptedMessage,
     associated_data: &[u8],
+    rng: &mut R,
 ) -> Result<Vec<u8>, RatchetError> {
     let header_dh = decode_32(&msg.header.dh_pub)?;
 
@@ -282,7 +334,7 @@ fn ratchet_decrypt_inner(
     };
     if is_new_dh {
         skip_message_keys(state, msg.header.pn)?;
-        dh_ratchet_step(state, header_dh)?;
+        dh_ratchet_step(state, header_dh, rng)?;
     }
 
     // 3. Bank any keys between where we are and this message's number.
@@ -401,7 +453,11 @@ fn skip_message_keys(state: &mut RatchetState, until: u32) -> Result<(), Ratchet
     Ok(())
 }
 
-fn dh_ratchet_step(state: &mut RatchetState, peer_dh_pub: [u8; 32]) -> Result<(), RatchetError> {
+fn dh_ratchet_step<R: RngCore + CryptoRng>(
+    state: &mut RatchetState,
+    peer_dh_pub: [u8; 32],
+    rng: &mut R,
+) -> Result<(), RatchetError> {
     state.previous_sending_chain_length = state.sending_msg_number;
     state.sending_msg_number = 0;
     state.receiving_msg_number = 0;
@@ -420,7 +476,7 @@ fn dh_ratchet_step(state: &mut RatchetState, peer_dh_pub: [u8; 32]) -> Result<()
     state.root_key = new_rk;
     state.receiving_chain_key = Some(recv_ck);
 
-    let new_dhs = generate_x25519();
+    let new_dhs = x25519_from_rng(rng);
     let dh_out_send = x25519_derive_shared(&new_dhs.priv_bytes, &peer_dh_pub);
     state.dhs = new_dhs;
     let (new_rk2, send_ck) = kdf_rk(&state.root_key, &dh_out_send)?;
@@ -914,5 +970,87 @@ mod tests {
         a.attach_session(1, &[2; 32], 10, 10).unwrap();
         a.zeroize_secrets();
         assert!(a.session.is_none());
+    }
+
+    // ------------------------------------------------------------ injectable randomness
+
+    fn seeded(b: u8) -> rand_chacha::ChaCha20Rng {
+        use rand_core::SeedableRng;
+        rand_chacha::ChaCha20Rng::from_seed([b; 32])
+    }
+
+    fn conversation(seed: u8) -> Vec<EncryptedMessage> {
+        // Alice sends two, Bob answers (a DH step on both sides), Alice again.
+        let mut rng = seeded(seed);
+        let mut spk_priv = [0u8; 32];
+        rng.fill_bytes(&mut spk_priv);
+        let spk_secret = x25519_dalek::StaticSecret::from(spk_priv);
+        let bob_spk = KeyPair {
+            priv_bytes: spk_secret.to_bytes(),
+            pub_bytes: x25519_dalek::PublicKey::from(&spk_secret).to_bytes(),
+        };
+        let ad = b"ad";
+        let mut a = init_initiator_with_rng([3; 32], bob_spk.pub_bytes, &mut rng).unwrap();
+        let mut b = init_responder([3; 32], bob_spk);
+        let mut out = Vec::new();
+        for text in [&b"uno"[..], b"dos"] {
+            let m = ratchet_encrypt_with_rng(&mut a, text, ad, &mut rng).unwrap();
+            assert_eq!(
+                ratchet_decrypt_with_rng(&mut b, &m, ad, &mut rng).unwrap(),
+                text
+            );
+            out.push(m);
+        }
+        let m = ratchet_encrypt_with_rng(&mut b, b"tres", ad, &mut rng).unwrap();
+        assert_eq!(
+            ratchet_decrypt_with_rng(&mut a, &m, ad, &mut rng).unwrap(),
+            b"tres"
+        );
+        out.push(m);
+        let m = ratchet_encrypt_with_rng(&mut a, b"cuatro", ad, &mut rng).unwrap();
+        assert_eq!(
+            ratchet_decrypt_with_rng(&mut b, &m, ad, &mut rng).unwrap(),
+            b"cuatro"
+        );
+        out.push(m);
+        out
+    }
+
+    fn wire(ms: &[EncryptedMessage]) -> Vec<String> {
+        ms.iter()
+            .map(|m| {
+                format!(
+                    "{}|{}|{}|{}|{}",
+                    m.header.dh_pub, m.header.pn, m.header.n, m.nonce, m.ciphertext
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_seeded_generator_gives_a_fixed_conversation() {
+        assert_eq!(wire(&conversation(1)), wire(&conversation(1)));
+        assert_ne!(wire(&conversation(1)), wire(&conversation(2)));
+    }
+
+    #[test]
+    fn the_seeded_and_the_os_paths_interoperate() {
+        let bob_spk = generate_x25519();
+        let mut rng = seeded(4);
+        let mut a = init_initiator_with_rng([5; 32], bob_spk.pub_bytes, &mut rng).unwrap();
+        let mut b = init_responder([5; 32], bob_spk);
+        let m = ratchet_encrypt_with_rng(&mut a, b"hola", b"", &mut rng).unwrap();
+        assert_eq!(ratchet_decrypt(&mut b, &m, b"").unwrap(), b"hola");
+        let r = ratchet_encrypt(&mut b, b"que tal", b"").unwrap();
+        assert_eq!(
+            ratchet_decrypt_with_rng(&mut a, &r, b"", &mut rng).unwrap(),
+            b"que tal"
+        );
+        // Every message of a conversation has its own nonce.
+        let ms = conversation(6);
+        let mut nonces: Vec<&String> = ms.iter().map(|m| &m.nonce).collect();
+        nonces.sort();
+        nonces.dedup();
+        assert_eq!(nonces.len(), ms.len());
     }
 }
