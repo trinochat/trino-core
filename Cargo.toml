@@ -97,3 +97,7 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.pbkdf2]
 opt-level = 3
+# The device list tests verify thousands of XEdDSA and Ed25519 signatures
+# (one per flipped bit); unoptimized curve arithmetic makes that minutes.
+[profile.dev.package.curve25519-dalek]
+opt-level = 3

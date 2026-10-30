@@ -26,7 +26,7 @@
 
 use crate::crypto::{aes_gcm_decrypt, aes_gcm_encrypt_with_nonce};
 use crate::mldsa;
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{Signer, SigningKey};
 use rand_core::{CryptoRng, OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use std::fmt;
@@ -111,6 +111,12 @@ impl ReserveKey {
     /// `rot_pqh = SHA-256(B_pq_pub)`.
     pub fn pq_hash(&self) -> [u8; 32] {
         self.pq_hash
+    }
+
+    /// Signs a rotation list (`rot_sig`, §3.1). Crate-only: `B` signs
+    /// nothing else.
+    pub(crate) fn sign_rotation(&self, list_bytes: &[u8]) -> [u8; 64] {
+        self.ed.sign(list_bytes).to_bytes()
     }
 
     /// `next` for this key.

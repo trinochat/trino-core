@@ -23,6 +23,7 @@ compile_error!("the test-kdf feature is for tests only: it must never reach a re
 
 pub mod call_signal;
 pub mod crypto;
+pub mod device;
 pub mod envelope;
 pub mod group;
 pub mod identity;
