@@ -21,8 +21,9 @@
 //! The blob is bound to its `next` through the AAD, and opening it checks
 //! that what comes out commits to that `next`.
 //!
-//! What is not here yet (VI-5): the rotation itself (`rot_key`, `rot_pqh`
-//! and `rot_sig` in a device list), and the account mailbox.
+//! The rotation list that `B` signs is built by
+//! `device::ListBody::sign_rotation` and accepted by `device::Chain` (VI-1).
+//! What is not here yet (VI-5): the account mailbox.
 
 use crate::crypto::{aes_gcm_decrypt, aes_gcm_encrypt_with_nonce};
 use crate::mldsa;

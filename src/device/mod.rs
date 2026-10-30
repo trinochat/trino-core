@@ -11,7 +11,8 @@
 //!   for accepting a new list;
 //! - [`retire`]: a device that unlinks itself;
 //! - [`echo`]: the `dl` echo every message carries;
-//! - [`bundle`]: the list with each device's prekeys, compact or full.
+//! - [`bundle`]: the list with each device's prekeys, compact or full;
+//! - [`handshake`]: the handshake bound to the lists (RV-06).
 //!
 //! The list only ever travels inside the ratchet or sealed in the account
 //! mailbox (§3.4), never in a public event.
@@ -19,12 +20,14 @@
 pub mod bundle;
 pub mod chain;
 pub mod echo;
+pub mod handshake;
 pub mod list;
 pub mod retire;
 
 pub use bundle::{DeviceBundle, DevicePrekeys};
 pub use chain::{Accepted, Chain, PendingNext};
 pub use echo::{on_echo, Echo, EchoActions, ListMark};
+pub use handshake::{check_peer_device, peer_classical, peer_prekeys};
 pub use list::{DeviceList, Entry, ListBody};
 pub use retire::Retirement;
 
@@ -101,6 +104,12 @@ pub enum DeviceError {
     /// A device's prekey is not signed by its `dev_sign`.
     #[error("a prekey of device {0} does not verify")]
     Prekey(u32),
+    /// A bundle whose list is not the one held for its account.
+    #[error("the bundle is not of the list held")]
+    NotCurrent,
+    /// A compact bundle has no post-quantum prekey: use PQ-11.
+    #[error("no post-quantum prekey for this device")]
+    NoPqPrekey,
     /// The primary holds `A`: it cannot retire, only hand it over.
     #[error("the primary cannot retire")]
     PrimaryRetirement,

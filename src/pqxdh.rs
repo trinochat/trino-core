@@ -47,8 +47,8 @@
 //! from `root'`, so the type 4 travels on the introduction mailbox: the
 //! initiator cannot compute the session one before opening it.
 //!
-//! Not here yet: that `dev_dh_ini` belongs to `A_ini`'s device list (§5.1,
-//! RV-06) is checked by the device list code (VI-1).
+//! That each device belongs to its account's device list (§5.1, RV-06) is
+//! checked at both ends by [`crate::device::handshake`] (VI-3).
 //!
 //! **`S_ses`** (design P1 §3.3) comes out with the secret on both sides:
 //! from `SK` and `AD` in the normal mode, from `root'` and `AD` in PQ-11,
@@ -108,6 +108,7 @@ pub struct SignedSpk {
 }
 
 /// What the initiator holds of the responding device.
+#[derive(Debug)]
 pub struct PeerPrekeys {
     /// The responder's account key `A`.
     pub account: [u8; 32],
@@ -310,6 +311,7 @@ pub fn respond(
 /// What the initiator holds of a device whose `pq_spk` it does not have:
 /// a group member who is not a contact yet, or a contact whose full
 /// `DeviceList` has not arrived (§21.6).
+#[derive(Debug)]
 pub struct PeerClassical {
     pub account: [u8; 32],
     pub dev_sign: [u8; 32],
