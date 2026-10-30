@@ -40,3 +40,4 @@ pub mod totp;
 pub mod vault;
 pub mod vault_v3;
 pub mod x3dh;
+pub mod xeddsa;

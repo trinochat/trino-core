@@ -24,6 +24,14 @@ x25519-dalek = { version = "2", features = ["serde", "static_secrets"] }
 ed25519-dalek = { version = "2", features = ["serde", "rand_core"] }
 aes-gcm = "0.10"
 hkdf = "0.12"
+# XEdDSA (xeddsa.rs), the signature of a device's X25519 key in its device
+# list entry (`dh_sig`, diseno-vinculacion.md §3.1). Written in this crate
+# over the curve arithmetic that x25519-dalek and ed25519-dalek already
+# bring (decided 30 Oct 2026: no XEdDSA crate). BSD-3-Clause.
+curve25519-dalek = "4.1"
+# Constant-time comparison and selection, already in the tree through the
+# dalek crates. BSD-3-Clause.
+subtle = "2.6"
 sha2 = "0.10"
 sha1 = "0.10"
 hmac = "0.12"
