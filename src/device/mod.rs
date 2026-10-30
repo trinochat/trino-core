@@ -9,16 +9,22 @@
 //! - [`list`]: the binary format, its signatures and its hash;
 //! - [`chain`]: what a receiver keeps of an account, and the eight rules
 //!   for accepting a new list;
-//! - [`retire`]: a device that unlinks itself.
+//! - [`retire`]: a device that unlinks itself;
+//! - [`echo`]: the `dl` echo every message carries;
+//! - [`bundle`]: the list with each device's prekeys, compact or full.
 //!
 //! The list only ever travels inside the ratchet or sealed in the account
 //! mailbox (§3.4), never in a public event.
 
+pub mod bundle;
 pub mod chain;
+pub mod echo;
 pub mod list;
 pub mod retire;
 
+pub use bundle::{DeviceBundle, DevicePrekeys};
 pub use chain::{Accepted, Chain, PendingNext};
+pub use echo::{on_echo, Echo, EchoActions, ListMark};
 pub use list::{DeviceList, Entry, ListBody};
 pub use retire::Retirement;
 
@@ -92,6 +98,9 @@ pub enum DeviceError {
     /// A retirement names no device of the list held.
     #[error("no such device")]
     UnknownDevice,
+    /// A device's prekey is not signed by its `dev_sign`.
+    #[error("a prekey of device {0} does not verify")]
+    Prekey(u32),
     /// The primary holds `A`: it cannot retire, only hand it over.
     #[error("the primary cannot retire")]
     PrimaryRetirement,
