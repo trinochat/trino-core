@@ -6,6 +6,7 @@ use crate::crypto::{
     NONCE_SIZE, TAG_SIZE,
 };
 use crate::identity::Identity;
+use crate::identity_v2::{from_serialized, to_serialized, IdentityV2, SerializedIdentityV2};
 use crate::kdf::KdfParams;
 use crate::vault::{
     check_app_data, deserialize_identity, serialize_identity, SerializedIdentity, VaultError,
@@ -427,6 +428,8 @@ pub(super) struct Body {
     pub k2fa: Zeroizing<[u8; 32]>,
     pub app: Option<Zeroizing<Vec<u8>>>,
     pub kit: Option<Zeroizing<Vec<u8>>>,
+    /// The identity after device linking (VI-2), next to today's.
+    pub identity_v2: Option<IdentityV2>,
     pub positions: Positions,
 }
 
@@ -436,6 +439,8 @@ struct SerializedBody {
     k2fa: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     kit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    identity_v2: Option<SerializedIdentityV2>,
     /// Positions of the real, emergency and recovery slots.
     slots: [u8; 3],
 }
@@ -454,6 +459,7 @@ impl Body {
             ),
             k2fa: hex::encode(&self.k2fa[..]),
             kit: self.kit.as_deref().map(hex::encode),
+            identity_v2: self.identity_v2.as_ref().map(to_serialized),
             slots: self.positions.to_array(),
         };
         let json =
@@ -491,6 +497,10 @@ impl Body {
             None => None,
         };
         let positions = Positions::from_array(s.slots)?;
+        let identity_v2 = match &s.identity_v2 {
+            Some(v2) => Some(from_serialized(v2).ok_or(VaultError::BadPayload)?),
+            None => None,
+        };
         let unsealed = deserialize_identity(&s.identity)?;
         // The TOTP secret lives in the shared block (design §4).
         if unsealed.totp_secret.is_some() {
@@ -501,6 +511,7 @@ impl Body {
             k2fa,
             app: unsealed.app,
             kit,
+            identity_v2,
             positions,
         })
     }

@@ -1411,3 +1411,90 @@ fn real_argon2id_emergency_path_and_redirect() {
         assert_eq!(opened.identity().ik_sign.pub_bytes, fresh.ik_sign.pub_bytes);
     }
 }
+
+// ---- Identity v2 (VI-2, diseno-vinculacion.md §23.1) -----------------------
+
+fn v2_json(id: &crate::identity_v2::IdentityV2) -> String {
+    serde_json::to_string(&crate::identity_v2::to_serialized(id)).unwrap()
+}
+
+#[test]
+fn identity_v2_is_sealed_next_to_the_identity_and_comes_back() {
+    let mut vault = create(None);
+    assert!(vault.identity_v2().is_none());
+    let v1_before = serde_json::to_string(&crate::vault::serialize_identity(
+        vault.identity(),
+        None,
+        None,
+    ))
+    .unwrap();
+    let mut rng = crate::kem::drbg();
+    let v2 =
+        crate::identity_v2::IdentityV2::migrate_from_v1(vault.identity(), 1_793_000_000, &mut rng);
+    let want = v2_json(&v2);
+    vault.set_identity_v2(Some(v2)).unwrap();
+    assert_eq!(v2_json(vault.identity_v2().unwrap()), want);
+
+    let reopened = real(unseal(vault.bytes(), PASS, None).unwrap());
+    assert_eq!(v2_json(reopened.identity_v2().unwrap()), want);
+    let v1_after = serde_json::to_string(&crate::vault::serialize_identity(
+        reopened.identity(),
+        None,
+        None,
+    ))
+    .unwrap();
+    assert_eq!(v1_after, v1_before, "today's identity stays as it was");
+
+    // A linked device: no account keys.
+    let mut vault = reopened;
+    let linked = crate::identity_v2::IdentityV2 {
+        device: crate::identity_v2::DeviceIdentity::generate_with_rng(1_793_000_000, &mut rng),
+        account: None,
+    };
+    let want = v2_json(&linked);
+    vault.set_identity_v2(Some(linked)).unwrap();
+    let reopened = real(unseal(vault.bytes(), PASS, None).unwrap());
+    assert!(reopened.identity_v2().unwrap().account.is_none());
+    assert_eq!(v2_json(reopened.identity_v2().unwrap()), want);
+
+    // And it can be cleared.
+    let mut vault = reopened;
+    vault.set_identity_v2(None).unwrap();
+    assert!(real(unseal(vault.bytes(), PASS, None).unwrap())
+        .identity_v2()
+        .is_none());
+}
+
+#[test]
+fn the_largest_body_still_fits_with_identity_v2() {
+    let identity = rotated_identity(40);
+    let mut vault = with_emergency(Some(&generate_totp_secret()));
+    vault
+        .set_app(Some(&[0xffu8; crate::vault::MAX_APP_DATA_LEN]))
+        .unwrap();
+    vault.set_kit(Some(&[0xeeu8; MAX_KIT_LEN])).unwrap();
+    vault.set_identity(identity.clone()).unwrap();
+    let before = open_body_json(vault.bytes(), &vault.mk, &vault.header)
+        .unwrap()
+        .len();
+    let mut rng = crate::kem::drbg();
+    let mut v2 = crate::identity_v2::IdentityV2::migrate_from_v1(&identity, 0, &mut rng);
+    // Two rotations: three SPKs and three pq_spk seeds, the most held.
+    let day = 24 * 60 * 60;
+    v2.device.rotate_prekeys_if_due_with_rng(30 * day, &mut rng);
+    v2.device.rotate_prekeys_if_due_with_rng(60 * day, &mut rng);
+    assert_eq!(v2.device.pq.retired.len(), 2);
+    vault.set_identity_v2(Some(v2)).unwrap();
+    let after = open_body_json(vault.bytes(), &vault.mk, &vault.header)
+        .unwrap()
+        .len();
+    println!(
+        "identity v2 adds {} bytes: {} of {}, {} to spare",
+        after - before,
+        after,
+        BODY_JSON_MAX,
+        BODY_JSON_MAX - after
+    );
+    assert!(after - before < 3 * 1024, "{} bytes", after - before);
+    assert!(BODY_JSON_MAX - after > BODY_JSON_MAX / 5);
+}

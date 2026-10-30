@@ -37,6 +37,7 @@ mod tests;
 
 use crate::crypto::random_array;
 use crate::identity::Identity;
+use crate::identity_v2::IdentityV2;
 use crate::kdf::KdfParams;
 use crate::totp::is_totp_code_valid;
 use crate::vault::{check_app_data, UnsealedVault, VaultError};
@@ -208,6 +209,7 @@ impl EmergencyVault {
             k2fa: Zeroizing::new(random_array()),
             app: account.app.map(|a| Zeroizing::new(a.to_vec())),
             kit: None,
+            identity_v2: None,
             positions,
         };
         assemble(self.kdf.clone(), header, slots, mk, body, shared)
@@ -244,6 +246,7 @@ fn create_with(
         k2fa: Zeroizing::new(random_array()),
         app: account.app.map(|a| Zeroizing::new(a.to_vec())),
         kit: None,
+        identity_v2: None,
         positions: Positions::random(),
     };
     let shared = Shared {
@@ -472,6 +475,18 @@ impl OpenVault {
 
     pub fn params(&self) -> KdfParams {
         self.header.params
+    }
+
+    /// The identity after device linking (VI-2), once the app has made one.
+    pub fn identity_v2(&self) -> Option<&IdentityV2> {
+        self.body.identity_v2.as_ref()
+    }
+
+    /// Replaces the identity after device linking and re-seals the body.
+    pub fn set_identity_v2(&mut self, identity: Option<IdentityV2>) -> Result<(), VaultError> {
+        let previous = std::mem::replace(&mut self.body.identity_v2, identity);
+        self.write_body()
+            .inspect_err(|_| self.body.identity_v2 = previous)
     }
 
     /// Replaces the identity (a rotated signed prekey, used one-time
