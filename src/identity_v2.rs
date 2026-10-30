@@ -76,6 +76,7 @@ pub struct AccountKeys {
 }
 
 /// One device's keys.
+#[derive(Clone)]
 pub struct DeviceIdentity {
     /// Its id in the device list: random, never reused.
     pub id: u32,
@@ -88,6 +89,7 @@ pub struct DeviceIdentity {
 }
 
 /// A device's identity, with the account keys if it is the primary.
+#[derive(Clone)]
 pub struct IdentityV2 {
     pub device: DeviceIdentity,
     pub account: Option<AccountKeys>,
@@ -673,5 +675,19 @@ mod tests {
                 serde_json::from_str(&json.replace(&from, &to)).unwrap();
             assert!(from_serialized(&bad).is_none());
         }
+    }
+
+    #[test]
+    fn an_identity_clones_with_the_same_keys() {
+        let id = IdentityV2::new_account_with_rng(T0, &mut drbg());
+        let copy = id.clone();
+        assert_eq!(copy.device.id, id.device.id);
+        assert_eq!(copy.device.dev_dh.pub_bytes, id.device.dev_dh.pub_bytes);
+        assert_eq!(copy.device.signed_spk(), id.device.signed_spk());
+        assert_eq!(copy.device.signed_pq_spk().ek, id.device.signed_pq_spk().ek);
+        assert_eq!(
+            copy.account.as_ref().unwrap().a.pub_bytes,
+            id.account.as_ref().unwrap().a.pub_bytes
+        );
     }
 }

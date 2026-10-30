@@ -46,6 +46,7 @@ pub enum PqSpkError {
 }
 
 /// One of this device's post-quantum prekeys.
+#[derive(Clone)]
 pub struct PqPrekey {
     pub id: u32,
     pub secret: KemSecret,
@@ -53,12 +54,14 @@ pub struct PqPrekey {
 }
 
 /// A prekey that is no longer current but still opens handshakes.
+#[derive(Clone)]
 pub struct RetiredPqPrekey {
     pub prekey: PqPrekey,
     pub retired_at: i64,
 }
 
 /// The current prekey and the retired ones still held.
+#[derive(Clone)]
 pub struct PqPrekeys {
     pub current: PqPrekey,
     pub retired: Vec<RetiredPqPrekey>,

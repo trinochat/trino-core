@@ -41,6 +41,7 @@ pub enum KemError {
 }
 
 /// A decapsulation key, kept as its seed.
+#[derive(Clone)]
 pub struct KemSecret {
     seed: Zeroizing<[u8; SEED_LEN]>,
 }
