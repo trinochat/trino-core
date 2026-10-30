@@ -54,6 +54,8 @@ pub const MAX_SEQ_STEP: u64 = 1 << 20;
 pub const NEXT_DELAY_SECS: u64 = 7 * 24 * 60 * 60;
 /// How many accepted lists are remembered to tell a fork.
 pub const HISTORY_LEN: usize = 32;
+/// How many removed or retired `dev_sign` a stored chain may carry.
+pub const MAX_REMOVED: usize = 4096;
 
 const ZERO32: [u8; 32] = [0; 32];
 
@@ -88,7 +90,7 @@ struct Seen {
 }
 
 /// What a receiver holds of one account.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Chain {
     current: DeviceList,
     current_hash: [u8; 32],
@@ -338,6 +340,126 @@ impl Chain {
             .filter(|e| !self.is_removed(&e.dev_sign))
             .filter(|e| !only_primary || e.is_primary())
             .collect()
+    }
+}
+
+impl Chain {
+    /// The whole state, to keep it on disk (the app's VI-8 store):
+    /// `"trino/chain/v1 " ‖ len u32 ‖ list ‖ next_in_force 32 ‖ pending u8
+    /// [‖ next 32 ‖ first_seen u64] ‖ removed u32 ‖ 32·removed ‖ history u8
+    /// ‖ (gen u32 ‖ seq u64 ‖ account 32 ‖ rot 32 ‖ hash 32)·history`.
+    pub fn encode(&self) -> Vec<u8> {
+        let list = self.current.encode();
+        let mut out = Vec::with_capacity(CHAIN_DOMAIN.len() + 4 + list.len() + 128);
+        out.extend_from_slice(CHAIN_DOMAIN);
+        out.extend_from_slice(&(list.len() as u32).to_be_bytes());
+        out.extend_from_slice(&list);
+        out.extend_from_slice(&self.next_in_force);
+        match &self.pending {
+            Some(p) => {
+                out.push(1);
+                out.extend_from_slice(&p.next);
+                out.extend_from_slice(&p.first_seen.to_be_bytes());
+            }
+            None => out.push(0),
+        }
+        out.extend_from_slice(&(self.removed.len() as u32).to_be_bytes());
+        for key in &self.removed {
+            out.extend_from_slice(key);
+        }
+        out.push(self.history.len() as u8);
+        for seen in &self.history {
+            out.extend_from_slice(&seen.gen.to_be_bytes());
+            out.extend_from_slice(&seen.seq.to_be_bytes());
+            out.extend_from_slice(&seen.account);
+            out.extend_from_slice(&seen.rot);
+            out.extend_from_slice(&seen.hash);
+        }
+        out
+    }
+
+    /// The state [`Chain::encode`] wrote. The list is checked again (its
+    /// signatures and its hash); anything else malformed, cut short or
+    /// longer is refused.
+    pub fn decode(b: &[u8]) -> Result<Chain, DeviceError> {
+        let mut r = Cursor(b);
+        if r.take(CHAIN_DOMAIN.len())? != CHAIN_DOMAIN {
+            return Err(DeviceError::Malformed);
+        }
+        let list_len = r.u32()? as usize;
+        let current = DeviceList::decode(r.take(list_len)?)?;
+        current.verify()?;
+        let next_in_force = r.arr()?;
+        let pending = match r.take(1)?[0] {
+            0 => None,
+            1 => Some(PendingNext {
+                next: r.arr()?,
+                first_seen: r.u64()?,
+            }),
+            _ => return Err(DeviceError::Malformed),
+        };
+        let removed_n = r.u32()? as usize;
+        if removed_n > MAX_REMOVED {
+            return Err(DeviceError::Malformed);
+        }
+        let removed = (0..removed_n)
+            .map(|_| r.arr())
+            .collect::<Result<Vec<_>, _>>()?;
+        let history_n = r.take(1)?[0] as usize;
+        if history_n > HISTORY_LEN {
+            return Err(DeviceError::Malformed);
+        }
+        let history = (0..history_n)
+            .map(|_| {
+                Ok(Seen {
+                    gen: r.u32()?,
+                    seq: r.u64()?,
+                    account: r.arr()?,
+                    rot: r.arr()?,
+                    hash: r.arr()?,
+                })
+            })
+            .collect::<Result<VecDeque<_>, DeviceError>>()?;
+        if !r.0.is_empty() {
+            return Err(DeviceError::Malformed);
+        }
+        Ok(Chain {
+            current_hash: current.hash(),
+            current,
+            next_in_force,
+            pending,
+            removed,
+            history,
+        })
+    }
+}
+
+/// The domain of a stored chain.
+const CHAIN_DOMAIN: &[u8] = b"trino/chain/v1 ";
+
+/// A reader of a stored chain that refuses to go past its end.
+struct Cursor<'a>(&'a [u8]);
+
+impl<'a> Cursor<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8], DeviceError> {
+        if self.0.len() < n {
+            return Err(DeviceError::Malformed);
+        }
+        let (a, rest) = self.0.split_at(n);
+        self.0 = rest;
+        Ok(a)
+    }
+
+    fn arr<const N: usize>(&mut self) -> Result<[u8; N], DeviceError> {
+        Ok(self.take(N)?.try_into().expect("N bytes taken"))
+    }
+
+    fn u32(&mut self) -> Result<u32, DeviceError> {
+        Ok(u32::from_be_bytes(self.arr()?))
+    }
+
+    fn u64(&mut self) -> Result<u64, DeviceError> {
+        Ok(u64::from_be_bytes(self.arr()?))
     }
 }
 
@@ -971,5 +1093,126 @@ pub(crate) mod tests {
         assert_eq!(chain.destinations(expires - 1, false).len(), 3);
         assert_eq!(chain.device_for_dh(&primary).unwrap().id, 1);
         assert!(chain.device_for_dh(&[9; 32]).is_none());
+    }
+
+    // ---- Kept on disk ------------------------------------------------------
+
+    /// A chain with a pending reserve, a removed device and some history.
+    fn lived_chain() -> (Account, Chain) {
+        let mut acct = Account::new(3);
+        acct.next = ReserveKey::generate().next();
+        let mut chain = start(&mut acct);
+        acct.next = ReserveKey::generate().next();
+        acct.devices.pop();
+        let list = acct.sign_next(T0 + 10);
+        chain.accept(list, T0 + 10, nobody).unwrap();
+        (acct, chain)
+    }
+
+    #[test]
+    fn a_chain_comes_back_whole_from_its_bytes() {
+        let (_, chain) = lived_chain();
+        assert!(chain.pending_next().is_some());
+        let bytes = chain.encode();
+        assert!(bytes.starts_with(b"trino/chain/v1 "));
+        let back = Chain::decode(&bytes).unwrap();
+        assert_eq!(back, chain);
+        assert_eq!(back.encode(), bytes);
+        // A fresh chain, without pending or removed, too.
+        let mut acct = Account::new(1);
+        let fresh = start(&mut acct);
+        assert_eq!(Chain::decode(&fresh.encode()).unwrap(), fresh);
+    }
+
+    #[test]
+    fn the_rules_go_on_after_the_chain_is_read_back() {
+        let (mut acct, chain) = lived_chain();
+        let mut back = Chain::decode(&chain.encode()).unwrap();
+        // The pending reserve keeps its first sight.
+        assert_eq!(
+            back.pending_next().unwrap().first_seen,
+            chain.pending_next().unwrap().first_seen
+        );
+        // A fork of the list held is still told.
+        let mut same_seq = acct.body_at(2, T0 + 30);
+        same_seq.entries.pop();
+        assert_eq!(
+            back.accept(same_seq.sign(&acct.a).unwrap(), T0 + 30, nobody)
+                .unwrap_err(),
+            DeviceError::Fork { gen: 1, seq: 2 }
+        );
+        // And the next list is accepted as on the chain kept in memory.
+        let next = acct.sign_next(T0 + 40);
+        let mut kept = chain.clone();
+        assert_eq!(
+            back.accept(next.clone(), T0 + 40, nobody).unwrap(),
+            kept.accept(next, T0 + 40, nobody).unwrap()
+        );
+        assert_eq!(back, kept);
+    }
+
+    #[test]
+    fn a_removed_device_stays_out_after_the_chain_is_read_back() {
+        let mut acct = Account::new(2);
+        let mut chain = start(&mut acct);
+        let leaving = acct.devices.pop().unwrap();
+        chain
+            .accept(acct.sign_next(T0 + 1), T0 + 1, nobody)
+            .unwrap();
+        let mut back = Chain::decode(&chain.encode()).unwrap();
+        assert!(back.is_removed(&leaving.1.sign.pub_bytes));
+        acct.devices.push(leaving);
+        assert!(matches!(
+            back.accept(acct.sign_next(T0 + 2), T0 + 2, nobody),
+            Err(DeviceError::Removed(_))
+        ));
+    }
+
+    #[test]
+    fn stored_chains_that_are_cut_altered_or_too_long_are_refused() {
+        let (_, chain) = lived_chain();
+        let bytes = chain.encode();
+        for n in [0, 10, 15, bytes.len() / 2, bytes.len() - 1] {
+            assert_eq!(Chain::decode(&bytes[..n]), Err(DeviceError::Malformed));
+        }
+        let mut longer = bytes.clone();
+        longer.push(0);
+        assert_eq!(Chain::decode(&longer), Err(DeviceError::Malformed));
+        let mut domain = bytes.clone();
+        domain[6] ^= 1;
+        assert_eq!(Chain::decode(&domain), Err(DeviceError::Malformed));
+        // The list's signature is checked again.
+        let at = 15 + 4 + 100;
+        let mut forged = bytes.clone();
+        forged[at] ^= 1;
+        assert!(Chain::decode(&forged).is_err());
+        // A pending flag that is neither 0 nor 1.
+        let list_len = u32::from_be_bytes(bytes[15..19].try_into().unwrap()) as usize;
+        let flag = 15 + 4 + list_len + 32;
+        let mut flag_bad = bytes.clone();
+        flag_bad[flag] = 2;
+        assert_eq!(Chain::decode(&flag_bad), Err(DeviceError::Malformed));
+    }
+
+    #[test]
+    fn a_stored_chain_with_more_history_than_kept_is_refused() {
+        let mut acct = Account::new(1);
+        let mut chain = start(&mut acct);
+        for i in 0..(HISTORY_LEN as u64 + 3) {
+            chain
+                .accept(acct.sign_next(T0 + i), T0 + i, nobody)
+                .unwrap();
+        }
+        let bytes = chain.encode();
+        assert_eq!(Chain::decode(&bytes).unwrap(), chain);
+        // The history count is the last header before its records.
+        let records = HISTORY_LEN * (4 + 8 + 32 * 3);
+        let count = bytes.len() - records - 1;
+        assert_eq!(bytes[count] as usize, HISTORY_LEN);
+        let mut over = bytes[..count].to_vec();
+        over.push(HISTORY_LEN as u8 + 1);
+        over.extend_from_slice(&bytes[count + 1..]);
+        over.extend_from_slice(&bytes[bytes.len() - (4 + 8 + 96)..]);
+        assert_eq!(Chain::decode(&over), Err(DeviceError::Malformed));
     }
 }
