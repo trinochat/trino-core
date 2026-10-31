@@ -183,6 +183,24 @@ impl Entry {
         }
     }
 
+    /// The entry's 209 bytes, as a list carries it. A `trino3:` contact
+    /// code carries the primary's entry on its own (`diseno-vinculacion.md`
+    /// §13.3).
+    pub fn to_bytes(&self) -> [u8; ENTRY_LEN] {
+        let mut out = Vec::with_capacity(ENTRY_LEN);
+        self.encode_into(&mut out);
+        out.try_into().expect("an entry is ENTRY_LEN bytes")
+    }
+
+    /// An entry from exactly [`ENTRY_LEN`] bytes. Its signatures are not
+    /// checked here: [`Entry::verify`] does, for the account it claims.
+    pub fn from_bytes(b: &[u8]) -> Result<Entry, DeviceError> {
+        if b.len() != ENTRY_LEN {
+            return Err(DeviceError::Malformed);
+        }
+        Entry::decode(b)
+    }
+
     fn encode_into(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.id.to_be_bytes());
         out.push(self.flags);
@@ -507,6 +525,37 @@ pub(crate) mod tests {
             rot_pqh: [0; 32],
             entries,
         }
+    }
+
+    #[test]
+    fn an_entry_alone_encodes_and_decodes_as_in_its_list() {
+        let account = [7u8; 32];
+        let device = Device::new();
+        let entry = device.entry(&account, 0x0102_0304, FLAG_PRIMARY);
+        let bytes = entry.to_bytes();
+        // The same 209 bytes a list carries after its head.
+        let mut in_list = Vec::new();
+        entry.encode_into(&mut in_list);
+        assert_eq!(bytes.as_slice(), in_list.as_slice());
+        assert_eq!(&bytes[..5], &[1, 2, 3, 4, FLAG_PRIMARY]);
+        let back = Entry::from_bytes(&bytes).unwrap();
+        assert_eq!(back, entry);
+        back.verify(&account).unwrap();
+    }
+
+    #[test]
+    fn an_entry_of_another_length_or_with_unknown_flags_is_refused() {
+        let entry = Device::new().entry(&[7; 32], 1, FLAG_PRIMARY);
+        let bytes = entry.to_bytes();
+        assert_eq!(
+            Entry::from_bytes(&bytes[..208]),
+            Err(DeviceError::Malformed)
+        );
+        let longer = [bytes.as_slice(), &[0]].concat();
+        assert_eq!(Entry::from_bytes(&longer), Err(DeviceError::Malformed));
+        let mut flags = bytes;
+        flags[4] = 0x80;
+        assert_eq!(Entry::from_bytes(&flags), Err(DeviceError::Malformed));
     }
 
     #[test]
